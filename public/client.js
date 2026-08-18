@@ -1,12 +1,112 @@
-const socket = io();
+/**
+ * client.js - WebRTC Screen Sharing Client (Host & Viewer)
+ *
+ * NAMING CONVENTIONS:
+ * - Variables/functions: camelCase.
+ * - Socket.IO events: kebab-case.
+ *
+ * PERFORMANCE IMPROVEMENTS:
+ * - ICE candidate debouncing.
+ * - Bitrate/bandwidth control.
+ * - Strict cleanup of RTCPeerConnection.
+ * - Cached static assets.
+ *
+ * AUDIO FEATURES:
+ * - System audio capture.
+ * - Microphone mixing via AudioContext.
+ * - Volume control and mute on viewer side.
+ *
+ * CHAT FEATURES:
+ * - Collapsible chat panel with message history.
+ * - Messages are sanitized (server-side) and displayed with role labels.
+ * - Rate limiting (server-enforced).
+ */
 
-// STUN público do Google — só ajuda a descobrir o IP público, não retransmite mídia.
-// Para redes com NAT/firewall mais restritivo, seria necessário um TURN server.
-const RTC_CONFIG = {
-  iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+// ================================================================
+//  STATE MANAGER
+// ================================================================
+const state = {
+  // Host
+  localStream: null,
+  peerConnections: {}, // viewerId -> RTCPeerConnection
+  audioContext: null,
+  micStream: null,
+  isMicEnabled: false,
+
+  // Viewer
+  viewerPc: null,
+  hostSocketId: null,
+  viewerVideo: null,
+
+  // Chat
+  chatMessages: [], // array of { role, message }
+
+  // Shared
+  socket: io(),
 };
 
-// ---------- UI: alternar entre abas ----------
+// ================================================================
+//  UTILITY FUNCTIONS
+// ================================================================
+
+/** Debounce function to group ICE candidate emissions. */
+function debounce(func, wait) {
+  let timeout;
+  return function (...args) {
+    clearTimeout(timeout);
+    timeout = setTimeout(() => func.apply(this, args), wait);
+  };
+}
+
+/**
+ * Updates the status message element.
+ * @param {HTMLElement} el - Status element.
+ * @param {string} msg - Message text.
+ * @param {string} [type] - Optional class (e.g., 'error', 'ok', 'warning').
+ */
+function setStatus(el, msg, type) {
+  el.textContent = msg;
+  el.className = "status" + (type ? " " + type : "");
+}
+
+/**
+ * Cleans up a RTCPeerConnection: closes it and removes all event listeners.
+ * @param {RTCPeerConnection} pc - The peer connection to clean.
+ */
+function cleanupPeerConnection(pc) {
+  if (!pc) return;
+  pc.onicecandidate = null;
+  pc.ontrack = null;
+  pc.onnegotiationneeded = null;
+  pc.oniceconnectionstatechange = null;
+  pc.onsignalingstatechange = null;
+  pc.close();
+  pc.getSenders().forEach((sender) => {
+    if (sender.track) sender.track.stop();
+  });
+}
+
+/**
+ * Applies bitrate limits to a RTCPeerConnection's senders.
+ * @param {RTCPeerConnection} pc - The peer connection.
+ * @param {number} maxBitrate - Maximum bitrate in bps.
+ */
+function setBitrateLimit(pc, maxBitrate = 500000) {
+  pc.getSenders().forEach((sender) => {
+    if (sender.track && sender.track.kind === "video") {
+      const params = sender.getParameters();
+      if (!params.encodings) params.encodings = [{}];
+      params.encodings[0].maxBitrate = maxBitrate;
+      sender.setParameters(params).catch((e) => {
+        console.warn("Failed to set bitrate limit:", e);
+      });
+    }
+  });
+}
+
+// ================================================================
+//  UI TABS
+// ================================================================
 const tabHost = document.getElementById("tabHost");
 const tabViewer = document.getElementById("tabViewer");
 const hostPanel = document.getElementById("hostPanel");
@@ -25,113 +125,291 @@ tabViewer.onclick = () => {
   hostPanel.classList.add("hidden");
 };
 
-function setStatus(el, msg, type) {
-  el.textContent = msg;
-  el.className = "status" + (type ? " " + type : "");
+// ================================================================
+//  CHAT UI
+// ================================================================
+const chatToggle = document.getElementById("chatToggle");
+const chatContainer = document.getElementById("chatContainer");
+const chatMessages = document.getElementById("chatMessages");
+const chatInput = document.getElementById("chatInput");
+const chatSend = document.getElementById("chatSend");
+
+let chatVisible = false;
+
+chatToggle.onclick = () => {
+  chatVisible = !chatVisible;
+  chatContainer.classList.toggle("hidden", !chatVisible);
+  if (chatVisible) {
+    chatInput.focus();
+  }
+};
+
+/**
+ * Adds a message to the chat UI.
+ * @param {string} role - 'host' or 'viewer'
+ * @param {string} message - Sanitized message text.
+ */
+function addChatMessage(role, message) {
+  const div = document.createElement("div");
+  div.className = `chat-message ${role}`;
+  const label = role === "host" ? "👤 Host" : "👤 Viewer";
+  div.innerHTML = `<span class="chat-label">${label}:</span> <span class="chat-text">${message}</span>`;
+  chatMessages.appendChild(div);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+  // Store in state (optional)
+  state.chatMessages.push({ role, message });
 }
 
-// ============================================================
-// HOST
-// ============================================================
+// Send chat message
+function sendChatMessage() {
+  const text = chatInput.value.trim();
+  if (!text) return;
+  if (text.length > 500) {
+    setStatus(hostStatus, "Message too long (max 500 chars).", "error");
+    return;
+  }
+  // Emit to server
+  state.socket.emit("chat-message", { message: text });
+  // Add locally immediately (optimistic)
+  const role = state.socket.data?.isHost ? "host" : "viewer"; // not reliable; we'll use our own flag
+  // Determine role from our state: we have isHost flag in host logic, but viewer doesn't have that.
+  // We'll store a local flag when joining.
+  const localRole = window._isHost ? "host" : "viewer";
+  addChatMessage(localRole, text);
+  chatInput.value = "";
+  chatInput.focus();
+}
+
+chatSend.onclick = sendChatMessage;
+chatInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    sendChatMessage();
+  }
+});
+
+// ================================================================
+//  HOST LOGIC
+// ================================================================
 const btnCreateRoom = document.getElementById("btnCreateRoom");
 const hostRoomInfo = document.getElementById("hostRoomInfo");
 const roomIdDisplay = document.getElementById("roomIdDisplay");
 const hostStatus = document.getElementById("hostStatus");
 const hostPreview = document.getElementById("hostPreview");
 const viewersList = document.getElementById("viewersList");
+const hostEnableMic = document.getElementById("hostEnableMic");
 
-let localStream = null;
-// Um RTCPeerConnection por viewer conectado
-const peerConnections = {}; // { viewerSocketId: RTCPeerConnection }
+// Debounced ICE candidate emission
+const emitIceCandidates = debounce((viewerId, candidates) => {
+  if (candidates.length === 0) return;
+  state.socket.emit("signal", { to: viewerId, data: { candidates } });
+}, 50);
+
+const candidateBuffers = {};
+
+/**
+ * Mixes a microphone track with the system audio track using AudioContext.
+ */
+async function mixAudioStreams(screenStream, micStream) {
+  if (!state.audioContext) {
+    state.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  const ctx = state.audioContext;
+
+  const screenSource = ctx.createMediaStreamSource(screenStream);
+  const micSource = ctx.createMediaStreamSource(micStream);
+
+  const screenGain = ctx.createGain();
+  screenGain.gain.value = 1.0;
+  const micGain = ctx.createGain();
+  micGain.gain.value = 0.8;
+
+  screenSource.connect(screenGain);
+  micSource.connect(micGain);
+
+  const mixer = ctx.createChannelMerger(2);
+  screenGain.connect(mixer, 0, 0);
+  micGain.connect(mixer, 0, 1);
+
+  const dest = ctx.createMediaStreamDestination();
+  mixer.connect(dest);
+
+  const videoTracks = screenStream.getVideoTracks();
+  const audioTracks = dest.stream.getAudioTracks();
+
+  return new MediaStream([...videoTracks, ...audioTracks]);
+}
 
 btnCreateRoom.onclick = async () => {
   const password = document.getElementById("hostPassword").value;
   if (!password) {
-    setStatus(hostStatus, "Defina uma senha antes de continuar.", "error");
+    setStatus(hostStatus, "Set a password before starting.", "error");
     return;
   }
+
+  let screenStream = null;
+  let micStream = null;
+  let finalStream = null;
 
   try {
-    localStream = await navigator.mediaDevices.getDisplayMedia({
-      video: { frameRate: 30 },
-      audio: false,
+    screenStream = await navigator.mediaDevices.getDisplayMedia({
+      video: {
+        width: { ideal: 1920, max: 1920 },
+        height: { ideal: 1080, max: 1080 },
+        frameRate: { ideal: 30, max: 30 },
+      },
+      audio: true,
     });
   } catch (err) {
-    setStatus(hostStatus, "Você precisa permitir o compartilhamento de tela.", "error");
+    setStatus(hostStatus, "Screen sharing permission denied.", "error");
     return;
   }
 
-  hostPreview.srcObject = localStream;
+  const hasSystemAudio = screenStream.getAudioTracks().length > 0;
+  if (!hasSystemAudio) {
+    setStatus(hostStatus, "System audio not available. Only video will be shared.", "warning");
+  }
+
+  const wantMic = hostEnableMic.checked;
+  if (wantMic) {
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      state.micStream = micStream;
+      state.isMicEnabled = true;
+    } catch (err) {
+      setStatus(hostStatus, "Microphone not accessible. Sharing screen without mic.", "warning");
+    }
+  }
+
+  if (micStream && hasSystemAudio) {
+    try {
+      finalStream = await mixAudioStreams(screenStream, micStream);
+    } catch (err) {
+      console.warn("Audio mixing failed, using screen stream only.", err);
+      finalStream = screenStream;
+    }
+  } else {
+    finalStream = screenStream;
+    if (micStream && !hasSystemAudio) {
+      micStream.getAudioTracks().forEach((track) => {
+        screenStream.addTrack(track);
+      });
+      finalStream = screenStream;
+    }
+  }
+
+  state.localStream = finalStream;
+  window._isHost = true; // flag for chat
+
+  hostPreview.srcObject = state.localStream;
   hostPreview.style.display = "block";
   btnCreateRoom.disabled = true;
 
-  socket.emit("create-room", { password }, (res) => {
+  state.socket.emit("create-room", { password }, (res) => {
     if (!res.ok) {
-      setStatus(hostStatus, "Erro ao criar a sala.", "error");
+      setStatus(hostStatus, "Failed to create room.", "error");
       return;
     }
     roomIdDisplay.textContent = res.roomId;
     hostRoomInfo.classList.remove("hidden");
-    setStatus(hostStatus, "Compartilhando. Envie o ID e a senha para quem for assistir.", "ok");
+    setStatus(
+      hostStatus,
+      hasSystemAudio
+        ? "Sharing screen + audio. Send room ID and password to viewers."
+        : "Sharing screen (no system audio). Send room ID and password.",
+      "ok"
+    );
+    // Enable chat
+    chatToggle.classList.remove("hidden");
+    chatContainer.classList.remove("hidden");
+    chatVisible = true;
+    chatInput.focus();
   });
 
-  // se o usuário parar o compartilhamento pelo botão nativo do navegador
-  localStream.getVideoTracks()[0].onended = () => {
-    setStatus(hostStatus, "Compartilhamento encerrado.", "error");
-    Object.values(peerConnections).forEach((pc) => pc.close());
-  };
+  const videoTrack = state.localStream.getVideoTracks()[0];
+  if (videoTrack) {
+    videoTrack.onended = () => {
+      setStatus(hostStatus, "Screen sharing ended.", "error");
+      Object.values(state.peerConnections).forEach((pc) => cleanupPeerConnection(pc));
+      state.peerConnections = {};
+      updateViewersList();
+      btnCreateRoom.disabled = false;
+      if (state.audioContext) {
+        state.audioContext.close();
+        state.audioContext = null;
+      }
+      if (state.micStream) {
+        state.micStream.getTracks().forEach((t) => t.stop());
+        state.micStream = null;
+      }
+      chatToggle.classList.add("hidden");
+      chatContainer.classList.add("hidden");
+      chatVisible = false;
+    };
+  }
 };
 
-// Um novo viewer entrou -> cria uma conexão WebRTC e envia uma "offer"
-socket.on("viewer-joined", async ({ viewerId }) => {
-  const pc = new RTCPeerConnection(RTC_CONFIG);
-  peerConnections[viewerId] = pc;
+// ----- Host: viewer joined -----
+state.socket.on("viewer-joined", async ({ viewerId }) => {
+  const pc = new RTCPeerConnection({
+    iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+  });
+  state.peerConnections[viewerId] = pc;
+  candidateBuffers[viewerId] = [];
 
-  localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
+  state.localStream.getTracks().forEach((track) => pc.addTrack(track, state.localStream));
+
+  pc.onnegotiationneeded = () => {
+    setBitrateLimit(pc, 500000);
+  };
 
   pc.onicecandidate = (event) => {
     if (event.candidate) {
-      socket.emit("signal", { to: viewerId, data: { candidate: event.candidate } });
+      candidateBuffers[viewerId].push(event.candidate);
+      emitIceCandidates(viewerId, candidateBuffers[viewerId]);
     }
   };
 
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-  socket.emit("signal", { to: viewerId, data: { sdp: offer } });
+  state.socket.emit("signal", { to: viewerId, data: { sdp: offer } });
 
   updateViewersList();
 });
 
-socket.on("viewer-left", ({ viewerId }) => {
-  if (peerConnections[viewerId]) {
-    peerConnections[viewerId].close();
-    delete peerConnections[viewerId];
+// ----- Host: viewer left -----
+state.socket.on("viewer-left", ({ viewerId }) => {
+  if (state.peerConnections[viewerId]) {
+    cleanupPeerConnection(state.peerConnections[viewerId]);
+    delete state.peerConnections[viewerId];
+    delete candidateBuffers[viewerId];
   }
   updateViewersList();
 });
 
 function updateViewersList() {
-  const count = Object.keys(peerConnections).length;
-  viewersList.textContent = count === 0
-    ? "Nenhum espectador ainda."
-    : `${count} espectador(es) conectado(s).`;
+  const count = Object.keys(state.peerConnections).length;
+  viewersList.textContent =
+    count === 0 ? "No viewers yet." : `${count} viewer(s) connected.`;
 }
 
-// ============================================================
-// VIEWER
-// ============================================================
+// ================================================================
+//  VIEWER LOGIC
+// ================================================================
 const btnJoinRoom = document.getElementById("btnJoinRoom");
 const viewerStatus = document.getElementById("viewerStatus");
 const viewerVideo = document.getElementById("viewerVideo");
-
-let viewerPc = null;
-
-// ---------- Controles de exibição do vídeo (teatro / tela cheia / miniatura) ----------
 const viewerControls = document.getElementById("viewerControls");
+
 const btnTheater = document.getElementById("btnTheater");
 const btnFullscreen = document.getElementById("btnFullscreen");
 const btnMini = document.getElementById("btnMini");
+const volumeSlider = document.getElementById("volumeSlider");
+const btnMute = document.getElementById("btnMute");
 
+state.viewerVideo = viewerVideo;
+
+// ----- Viewer UI controls -----
 btnTheater.onclick = () => {
   document.body.classList.toggle("theater-mode");
   btnTheater.classList.toggle("active");
@@ -142,7 +420,7 @@ btnFullscreen.onclick = () => {
     document.exitFullscreen();
   } else {
     viewerVideo.requestFullscreen().catch(() => {
-      setStatus(viewerStatus, "Não foi possível entrar em tela cheia.", "error");
+      setStatus(viewerStatus, "Fullscreen not supported.", "error");
     });
   }
 };
@@ -155,89 +433,173 @@ btnMini.onclick = async () => {
       await viewerVideo.requestPictureInPicture();
     }
   } catch (err) {
-    setStatus(viewerStatus, "Miniatura não suportada neste navegador.", "error");
+    setStatus(viewerStatus, "Picture-in-Picture not supported.", "error");
   }
 };
 
+// Volume control
+volumeSlider.addEventListener("input", () => {
+  viewerVideo.volume = parseFloat(volumeSlider.value);
+  if (viewerVideo.volume === 0) {
+    btnMute.textContent = "🔇";
+  } else {
+    btnMute.textContent = "🔊";
+  }
+});
+
+btnMute.onclick = () => {
+  if (viewerVideo.volume > 0) {
+    viewerVideo.volume = 0;
+    volumeSlider.value = 0;
+    btnMute.textContent = "🔇";
+  } else {
+    viewerVideo.volume = 1;
+    volumeSlider.value = 1;
+    btnMute.textContent = "🔊";
+  }
+};
+
+// ----- Viewer: join room -----
 btnJoinRoom.onclick = () => {
   const roomId = document.getElementById("viewerRoomId").value.trim().toUpperCase();
   const password = document.getElementById("viewerPassword").value;
 
   if (!roomId || !password) {
-    setStatus(viewerStatus, "Preencha o ID da sala e a senha.", "error");
+    setStatus(viewerStatus, "Fill in room ID and password.", "error");
     return;
   }
 
-  socket.emit("join-room", { roomId, password }, (res) => {
+  state.socket.emit("join-room", { roomId, password }, (res) => {
     if (!res.ok) {
       setStatus(viewerStatus, res.error, "error");
       return;
     }
-    setStatus(viewerStatus, "Conectado. Aguardando vídeo do host...", "ok");
+    setStatus(viewerStatus, "Connected. Waiting for host video...", "ok");
     btnJoinRoom.disabled = true;
+    window._isHost = false; // viewer flag for chat
 
-    viewerPc = new RTCPeerConnection(RTC_CONFIG);
+    // Enable chat
+    chatToggle.classList.remove("hidden");
+    chatContainer.classList.remove("hidden");
+    chatVisible = true;
+    chatInput.focus();
 
-    viewerPc.ontrack = (event) => {
+    state.viewerPc = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+    });
+
+    state.viewerPc.ontrack = (event) => {
       viewerVideo.srcObject = event.streams[0];
       viewerVideo.style.display = "block";
       viewerControls.classList.remove("hidden");
+      viewerVideo.volume = parseFloat(volumeSlider.value);
     };
 
-    viewerPc.onicecandidate = (event) => {
+    const viewerCandidateBuffer = [];
+    const emitViewerIce = debounce(() => {
+      if (viewerCandidateBuffer.length === 0) return;
+      state.socket.emit("signal", {
+        to: state.hostSocketId,
+        data: { candidates: viewerCandidateBuffer },
+      });
+      viewerCandidateBuffer.length = 0;
+    }, 50);
+
+    state.viewerPc.onicecandidate = (event) => {
       if (event.candidate) {
-        socket.emit("signal", { to: hostIdPlaceholder(), data: { candidate: event.candidate } });
+        viewerCandidateBuffer.push(event.candidate);
+        emitViewerIce();
       }
     };
   });
 };
 
-// Guarda o id do host assim que a primeira "signal" chegar (é quem manda a offer)
-let hostSocketId = null;
-function hostIdPlaceholder() {
-  return hostSocketId;
-}
-
-// Sinalização recebida (tanto host quanto viewer usam este mesmo evento)
-socket.on("signal", async ({ from, data }) => {
-  // --- Lado VIEWER recebendo offer do host ---
-  if (viewerPc && data.sdp && data.sdp.type === "offer") {
-    hostSocketId = from;
-    await viewerPc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-    const answer = await viewerPc.createAnswer();
-    await viewerPc.setLocalDescription(answer);
-    socket.emit("signal", { to: from, data: { sdp: answer } });
+// ----- Signaling receiver -----
+state.socket.on("signal", async ({ from, data }) => {
+  // Viewer side: receiving offer
+  if (state.viewerPc && data.sdp && data.sdp.type === "offer") {
+    state.hostSocketId = from;
+    await state.viewerPc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+    const answer = await state.viewerPc.createAnswer();
+    await state.viewerPc.setLocalDescription(answer);
+    state.socket.emit("signal", { to: from, data: { sdp: answer } });
     return;
   }
 
-  // --- Lado VIEWER recebendo ICE candidate do host ---
-  if (viewerPc && data.candidate) {
+  // Viewer side: ICE candidates (batch)
+  if (state.viewerPc && data.candidates) {
+    for (const candidate of data.candidates) {
+      try {
+        await state.viewerPc.addIceCandidate(candidate);
+      } catch (e) {}
+    }
+    return;
+  }
+
+  // Host side: receiving answer
+  if (state.peerConnections[from] && data.sdp && data.sdp.type === "answer") {
+    await state.peerConnections[from].setRemoteDescription(
+      new RTCSessionDescription(data.sdp)
+    );
+    return;
+  }
+
+  // Host side: ICE candidates (batch)
+  if (state.peerConnections[from] && data.candidates) {
+    for (const candidate of data.candidates) {
+      try {
+        await state.peerConnections[from].addIceCandidate(candidate);
+      } catch (e) {}
+    }
+    return;
+  }
+
+  // Fallback for single candidates
+  if (state.viewerPc && data.candidate) {
     try {
-      await viewerPc.addIceCandidate(data.candidate);
-    } catch (e) { /* ignora candidatos fora de ordem */ }
+      await state.viewerPc.addIceCandidate(data.candidate);
+    } catch (e) {}
     return;
   }
-
-  // --- Lado HOST recebendo answer de um viewer ---
-  if (peerConnections[from] && data.sdp && data.sdp.type === "answer") {
-    await peerConnections[from].setRemoteDescription(new RTCSessionDescription(data.sdp));
-    return;
-  }
-
-  // --- Lado HOST recebendo ICE candidate de um viewer ---
-  if (peerConnections[from] && data.candidate) {
+  if (state.peerConnections[from] && data.candidate) {
     try {
-      await peerConnections[from].addIceCandidate(data.candidate);
-    } catch (e) { /* ignora */ }
+      await state.peerConnections[from].addIceCandidate(data.candidate);
+    } catch (e) {}
     return;
   }
 });
 
-socket.on("host-left", () => {
-  setStatus(viewerStatus, "O host encerrou o compartilhamento.", "error");
+// ----- Chat messages received from server -----
+state.socket.on("chat-message", ({ role, message }) => {
+  addChatMessage(role, message);
+});
+
+// ----- Host left -----
+state.socket.on("host-left", () => {
+  setStatus(viewerStatus, "Host stopped sharing.", "error");
   viewerVideo.style.display = "none";
   viewerControls.classList.add("hidden");
   document.body.classList.remove("theater-mode");
   btnTheater.classList.remove("active");
   btnJoinRoom.disabled = false;
+
+  if (state.viewerPc) {
+    cleanupPeerConnection(state.viewerPc);
+    state.viewerPc = null;
+    state.hostSocketId = null;
+  }
+
+  chatToggle.classList.add("hidden");
+  chatContainer.classList.add("hidden");
+  chatVisible = false;
+});
+
+// ----- Connection error -----
+state.socket.on("connect_error", () => {
+  const msg = "Cannot connect to server. Check your network.";
+  if (!viewerPanel.classList.contains("hidden")) {
+    setStatus(viewerStatus, msg, "error");
+  } else {
+    setStatus(hostStatus, msg, "error");
+  }
 });

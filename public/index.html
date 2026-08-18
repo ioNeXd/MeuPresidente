@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html lang="en">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Compartilhar Tela</title>
+<title>Screen Sharing – WebRTC P2P</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -25,8 +25,14 @@
     padding: 28px;
     width: 100%;
     max-width: 460px;
+    position: relative;
   }
-  h1 { font-size: 1.3rem; margin: 0 0 4px; }
+  .header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  h1 { font-size: 1.3rem; margin: 0; }
   p.sub { color: #9aa0ab; margin: 0 0 20px; font-size: 0.9rem; }
   .tabs { display: flex; gap: 8px; margin-bottom: 20px; }
   .tab {
@@ -36,9 +42,19 @@
   }
   .tab.active { background: #3b5bfd; border-color: #3b5bfd; color: #fff; }
   label { display: block; font-size: 0.85rem; margin: 12px 0 6px; color: #b7bcc7; }
-  input {
+  input[type="text"],
+  input[type="password"] {
     width: 100%; padding: 10px 12px; border-radius: 8px;
     border: 1px solid #2a2e38; background: #0f1115; color: #fff; font-size: 1rem;
+  }
+  .checkbox-group {
+    display: flex; align-items: center; gap: 10px; margin-top: 10px;
+  }
+  .checkbox-group input[type="checkbox"] {
+    width: 18px; height: 18px; accent-color: #3b5bfd;
+  }
+  .checkbox-group label {
+    margin: 0; font-size: 0.9rem; color: #b7bcc7;
   }
   button.primary {
     width: 100%; margin-top: 20px; padding: 12px; border: none;
@@ -58,7 +74,8 @@
   }
   #viewerVideoWrap { position: relative; }
   .video-controls {
-    display: flex; gap: 8px; margin-top: 10px; justify-content: center;
+    display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px;
+    justify-content: center; align-items: center;
   }
   .ctrl-btn {
     padding: 8px 14px; border-radius: 8px; border: 1px solid #2a2e38;
@@ -66,8 +83,77 @@
   }
   .ctrl-btn:hover { background: #2a2e38; }
   .ctrl-btn.active { background: #3b5bfd; border-color: #3b5bfd; color: #fff; }
+  .volume-control {
+    display: flex; align-items: center; gap: 8px;
+  }
+  .volume-control input[type="range"] {
+    width: 80px; accent-color: #3b5bfd;
+  }
+  .volume-control .mute-btn {
+    background: none; border: none; color: #e6e6e6; font-size: 1.2rem;
+    cursor: pointer; padding: 0 4px;
+  }
+  .volume-control .mute-btn:hover { color: #3b5bfd; }
 
-  /* Modo teatro: expande o card pra ocupar a tela, com o vídeo bem maior */
+  /* Chat */
+  #chatToggle {
+    background: none; border: 1px solid #2a2e38; border-radius: 8px;
+    color: #e6e6e6; font-size: 1.2rem; padding: 4px 10px; cursor: pointer;
+    margin-left: 8px;
+  }
+  #chatToggle:hover { background: #2a2e38; }
+  #chatToggle.hidden { display: none; }
+  #chatContainer {
+    margin-top: 16px;
+    border: 1px solid #2a2e38;
+    border-radius: 8px;
+    background: #0f1115;
+    padding: 10px;
+  }
+  #chatContainer.hidden { display: none; }
+  #chatMessages {
+    max-height: 150px;
+    overflow-y: auto;
+    padding-right: 4px;
+    margin-bottom: 8px;
+    font-size: 0.9rem;
+  }
+  #chatMessages .chat-message {
+    padding: 2px 0;
+    border-bottom: 1px solid #1f232c;
+  }
+  #chatMessages .chat-message:last-child { border-bottom: none; }
+  #chatMessages .chat-label {
+    font-weight: bold;
+    color: #9aa0ab;
+    margin-right: 6px;
+  }
+  #chatMessages .chat-message.host .chat-label { color: #3b5bfd; }
+  #chatMessages .chat-message.viewer .chat-label { color: #4ade80; }
+  .chat-input-row {
+    display: flex;
+    gap: 8px;
+  }
+  .chat-input-row input {
+    flex: 1;
+    padding: 6px 10px;
+    border-radius: 6px;
+    border: 1px solid #2a2e38;
+    background: #0f1115;
+    color: #fff;
+    font-size: 0.9rem;
+  }
+  .chat-input-row button {
+    padding: 6px 14px;
+    border: none;
+    border-radius: 6px;
+    background: #3b5bfd;
+    color: #fff;
+    cursor: pointer;
+  }
+  .chat-input-row button:hover { background: #2f4bdb; }
+
+  /* Theater mode */
   body.theater-mode {
     align-items: flex-start;
     padding: 16px;
@@ -83,6 +169,7 @@
   body.theater-mode .tabs,
   body.theater-mode #hostPanel > label,
   body.theater-mode #hostPanel > input,
+  body.theater-mode #hostPanel .checkbox-group,
   body.theater-mode #viewerPanel > label,
   body.theater-mode #viewerPanel > input,
   body.theater-mode #btnJoinRoom {
@@ -91,6 +178,7 @@
   .status { font-size: 0.85rem; color: #9aa0ab; margin-top: 10px; min-height: 18px; }
   .status.error { color: #ff6b6b; }
   .status.ok { color: #4ade80; }
+  .status.warning { color: #fbbf24; }
   .hidden { display: none !important; }
   .viewers-list { margin-top: 12px; font-size: 0.85rem; color: #9aa0ab; }
 </style>
@@ -98,46 +186,69 @@
 <body>
 
 <div class="card">
-  <h1>🖥️ Compartilhamento de Tela</h1>
-  <p class="sub">Protótipo P2P via WebRTC — crie uma sala ou entre com um ID</p>
+  <div class="header">
+    <h1>🖥️ Screen Sharing</h1>
+    <button id="chatToggle" class="hidden" title="Toggle chat">💬</button>
+  </div>
+  <p class="sub">P2P WebRTC prototype — create a room or join with an ID</p>
 
   <div class="tabs">
-    <div class="tab active" id="tabHost">Compartilhar (Host)</div>
-    <div class="tab" id="tabViewer">Assistir (Viewer)</div>
+    <div class="tab active" id="tabHost">Share (Host)</div>
+    <div class="tab" id="tabViewer">Watch (Viewer)</div>
   </div>
 
-  <!-- HOST -->
+  <!-- HOST PANEL -->
   <div id="hostPanel">
-    <label>Senha da sala</label>
-    <input id="hostPassword" type="password" placeholder="Defina uma senha" />
-    <button class="primary" id="btnCreateRoom">Iniciar compartilhamento</button>
+    <label>Room password</label>
+    <input id="hostPassword" type="password" placeholder="Set a password" />
+
+    <div class="checkbox-group">
+      <input type="checkbox" id="hostEnableMic" checked />
+      <label for="hostEnableMic">🎤 Include microphone (mix with system audio)</label>
+    </div>
+
+    <button class="primary" id="btnCreateRoom">Start sharing</button>
 
     <div class="room-info hidden" id="hostRoomInfo">
-      ID da sala: <b id="roomIdDisplay"></b>
-      <div class="viewers-list" id="viewersList">Nenhum espectador ainda.</div>
+      Room ID: <b id="roomIdDisplay"></b>
+      <div class="viewers-list" id="viewersList">No viewers yet.</div>
     </div>
 
     <video id="hostPreview" autoplay muted></video>
     <div class="status" id="hostStatus"></div>
   </div>
 
-  <!-- VIEWER -->
+  <!-- VIEWER PANEL -->
   <div id="viewerPanel" class="hidden">
-    <label>ID da sala</label>
-    <input id="viewerRoomId" type="text" placeholder="Ex: 7F3K9A" style="text-transform:uppercase" />
-    <label>Senha</label>
-    <input id="viewerPassword" type="password" placeholder="Senha da sala" />
-    <button class="primary" id="btnJoinRoom">Entrar na sala</button>
+    <label>Room ID</label>
+    <input id="viewerRoomId" type="text" placeholder="e.g. 7F3K9A" style="text-transform:uppercase" />
+    <label>Password</label>
+    <input id="viewerPassword" type="password" placeholder="Room password" />
+    <button class="primary" id="btnJoinRoom">Join room</button>
 
     <div id="viewerVideoWrap">
       <video id="viewerVideo" autoplay></video>
       <div class="video-controls hidden" id="viewerControls">
-        <button class="ctrl-btn" id="btnTheater" title="Modo teatro">🎬 Teatro</button>
-        <button class="ctrl-btn" id="btnFullscreen" title="Tela cheia">⛶ Tela cheia</button>
-        <button class="ctrl-btn" id="btnMini" title="Miniatura (janela flutuante)">🗗 Miniatura</button>
+        <button class="ctrl-btn" id="btnTheater" title="Theater mode">🎬 Theater</button>
+        <button class="ctrl-btn" id="btnFullscreen" title="Fullscreen">⛶ Fullscreen</button>
+        <button class="ctrl-btn" id="btnMini" title="Picture-in-Picture">🗗 Mini</button>
+
+        <div class="volume-control">
+          <button class="mute-btn" id="btnMute" title="Mute">🔊</button>
+          <input type="range" id="volumeSlider" min="0" max="1" step="0.01" value="1" />
+        </div>
       </div>
     </div>
     <div class="status" id="viewerStatus"></div>
+  </div>
+
+  <!-- CHAT PANEL (shared) -->
+  <div id="chatContainer" class="hidden">
+    <div id="chatMessages"></div>
+    <div class="chat-input-row">
+      <input type="text" id="chatInput" placeholder="Type a message..." maxlength="500" />
+      <button id="chatSend">Send</button>
+    </div>
   </div>
 </div>
 

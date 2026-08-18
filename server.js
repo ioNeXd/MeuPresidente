@@ -1,69 +1,312 @@
+/**
+ * server.js - WebRTC Signaling Server with room management and security.
+ *
+ * NAMING CONVENTIONS:
+ * - Variables, functions, and methods: camelCase (e.g., `roomId`, `generateRoomId`).
+ * - Socket.IO event names: kebab-case (e.g., `create-room`, `join-room`, `viewer-joined`).
+ * - Environment variables: UPPER_SNAKE_CASE (e.g., `MAX_CONNECTIONS_PER_IP`).
+ *
+ * SECURITY FEATURES:
+ * - Per-IP and total connection limits.
+ * - Orphaned room expiration (TTL).
+ * - Input validation (roomId format, password length).
+ * - Conditional HSTS/COOP headers via `ALLOW_INSECURE_ORIGIN`.
+ * - Explicit CORS configuration for Socket.IO.
+ * - Security event logging (in-memory buffer with console output).
+ * - Chat: rate limiting (500ms cooldown), max length 500 chars, HTML escaping.
+ */
+
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const crypto = require("crypto");
 const helmet = require("helmet");
 
+// ---------------------------------------------------------------------------
+// Environment configuration
+// ---------------------------------------------------------------------------
+// In production (NODE_ENV=production, e.g., Render), strict security headers
+// (HSTS, upgrade-insecure-requests, COOP) are enabled by default. Set
+// ALLOW_INSECURE_ORIGIN=1 to relax them and allow access via plain IP/HTTP
+// (local testing via LAN, Radmin, etc.).
+const ALLOW_INSECURE_ORIGIN =
+  process.env.ALLOW_INSECURE_ORIGIN === "1" || process.env.NODE_ENV !== "production";
+
+// Per-IP and total connection limits (basic DoS mitigation).
+const MAX_CONNECTIONS_PER_IP = parseInt(process.env.MAX_CONNECTIONS_PER_IP, 10) || 10;
+const MAX_TOTAL_CONNECTIONS = parseInt(process.env.MAX_TOTAL_CONNECTIONS, 10) || 200;
+
+// Orphaned room expiration (rooms without a connected host).
+const ROOM_TTL_MS = (parseFloat(process.env.ROOM_TTL_MINUTES) || 10) * 60 * 1000;
+const ROOM_SWEEP_INTERVAL_MS = parseInt(process.env.ROOM_SWEEP_INTERVAL_MS, 10) || 60 * 1000;
+
+// Allowed CORS origins (comma-separated). Empty = same-origin only.
+const APP_ORIGINS = (process.env.APP_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+// Trust the X-Forwarded-For header (behind a proxy like Render). Never trust it
+// outside production, as it can be spoofed by the client.
+const TRUST_PROXY = process.env.TRUST_PROXY === "1" || process.env.NODE_ENV === "production";
+
+// ---------------------------------------------------------------------------
+// Security event logging (console + in-memory buffer; not exposed publicly)
+// ---------------------------------------------------------------------------
+const MAX_SECURITY_LOG = 200;
+const securityEvents = [];
+
+/**
+ * Logs a security-related event.
+ * @param {string} type - Event type (e.g., 'join-rejected', 'origin-rejected').
+ * @param {Object} details - Additional context (IP, roomId, etc.).
+ */
+function logSecurity(type, details = {}) {
+  const entry = { type, at: new Date().toISOString(), ...details };
+  securityEvents.push(entry);
+  if (securityEvents.length > MAX_SECURITY_LOG) securityEvents.shift();
+  console.log(`[security] ${type}`, JSON.stringify(details));
+}
+
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
 
-// Cabeçalhos de segurança básicos (CSP relaxado pro necessário rodar: socket.io + WebRTC)
-// Observação: upgradeInsecureRequests é removido de propósito. Por padrão o helmet ativa essa
-// diretiva, que manda o navegador reescrever TODO request http:// pra https:// automaticamente.
-// Isso quebra o acesso via IP puro sem HTTPS (ex: testes locais via Radmin/LAN), porque o
-// navegador tenta buscar os scripts em https:// num servidor que só fala http:// — daí o
-// ERR_SSL_PROTOCOL_ERROR. Em produção atrás de HTTPS de verdade (Render, etc.) isso não faz
-// falta, porque a conexão já é https:// desde o início.
-app.use(
-  helmet({
-    contentSecurityPolicy: {
-      directives: {
-        defaultSrc: ["'self'"],
-        scriptSrc: ["'self'"],
-        connectSrc: ["'self'", "ws:", "wss:"],
-        imgSrc: ["'self'", "data:"],
-        styleSrc: ["'self'", "'unsafe-inline'"],
-        mediaSrc: ["'self'", "blob:"],
-        upgradeInsecureRequests: null,
-      },
+// ---------------------------------------------------------------------------
+// Security headers (helmet) — strict in production, relaxed for local testing.
+// ---------------------------------------------------------------------------
+// Note: upgradeInsecureRequests is intentionally removed in insecure mode.
+// In production behind true HTTPS (Render, etc.), it is enabled because the
+// connection is already HTTPS.
+const helmetConfig = {
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'"],
+      connectSrc: ["'self'", "ws:", "wss:"],
+      imgSrc: ["'self'", "data:"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      mediaSrc: ["'self'", "blob:"],
     },
-    crossOriginOpenerPolicy: false,
+  },
+  // undefined = default (enabled); false = disabled
+  strictTransportSecurity: ALLOW_INSECURE_ORIGIN ? false : undefined,
+  crossOriginOpenerPolicy: ALLOW_INSECURE_ORIGIN ? false : undefined,
+};
+if (ALLOW_INSECURE_ORIGIN) {
+  helmetConfig.contentSecurityPolicy.directives.upgradeInsecureRequests = null;
+}
+app.use(helmet(helmetConfig));
+
+// Serve static files with caching (1 day max-age, ETag enabled)
+app.use(
+  express.static("public", {
+    maxAge: "1d",
+    etag: true,
+    setHeaders: (res, path) => {
+      if (path.includes("client.js") || path.includes("style.css")) {
+        res.setHeader("Cache-Control", "public, max-age=86400");
+      }
+    },
   })
 );
 
-app.use(express.static("public"));
+// ---------------------------------------------------------------------------
+// Socket.IO
+// ---------------------------------------------------------------------------
+const io = new Server(server, {
+  cors: APP_ORIGINS.length > 0 ? { origin: APP_ORIGINS, methods: ["GET", "POST"] } : false,
+});
 
-// Guarda as salas em memória: { roomId: { passwordHash, hostSocketId } }
+// ---- Connection tracking per IP ----
+const connectionsPerIp = new Map(); // ip -> active connection count
+
+/**
+ * Normalizes an IP address (removes IPv6 prefix if present).
+ * @param {string} addr - Raw address.
+ * @returns {string} Normalized address.
+ */
+function normalizeIp(addr) {
+  return typeof addr === "string" ? addr.replace(/^::ffff:/, "") : "unknown";
+}
+
+/**
+ * Extracts the client IP from the request, respecting TRUST_PROXY.
+ * @param {http.IncomingMessage} req - Express request object.
+ * @returns {string} Client IP address.
+ */
+function getClientIp(req) {
+  if (TRUST_PROXY) {
+    const forwarded = req.headers["x-forwarded-for"];
+    if (typeof forwarded === "string" && forwarded.length > 0) {
+      return forwarded.split(",")[0].trim();
+    }
+  }
+  return normalizeIp(req.socket && req.socket.remoteAddress);
+}
+
+/**
+ * Helper to reject a handshake with a given status and message.
+ * @param {http.ServerResponse} res - Response object.
+ * @param {number} status - HTTP status code.
+ * @param {string} message - Error message.
+ */
+function rejectHandshake(res, status, message) {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: message }));
+}
+
+// Socket.IO engine middleware (runs for polling and WebSocket upgrades).
+io.engine.use((req, res, next) => {
+  // 1) Origin validation: same-origin or explicit whitelist.
+  const origin = req.headers.origin;
+  if (origin) {
+    const host = req.headers.host;
+    const sameOrigin =
+      typeof host === "string" && (origin === `http://${host}` || origin === `https://${host}`);
+    const allowed = APP_ORIGINS.length > 0 ? APP_ORIGINS.includes(origin) : sameOrigin;
+    if (!allowed) {
+      logSecurity("origin-rejected", { origin, host });
+      return rejectHandshake(res, 403, "Unauthorized origin.");
+    }
+  }
+
+  // 2) Connection limits — applied only on initial handshake (no sid).
+  if (!req._query.sid) {
+    const ip = getClientIp(req);
+    const current = connectionsPerIp.get(ip) || 0;
+    if (current >= MAX_CONNECTIONS_PER_IP) {
+      logSecurity("connection-limit-per-ip", { ip, current, limit: MAX_CONNECTIONS_PER_IP });
+      return rejectHandshake(res, 429, "Per-IP connection limit reached.");
+    }
+    if (io.engine.clientsCount >= MAX_TOTAL_CONNECTIONS) {
+      logSecurity("connection-limit-total", {
+        current: io.engine.clientsCount,
+        limit: MAX_TOTAL_CONNECTIONS,
+      });
+      return rejectHandshake(res, 429, "Server connection limit reached.");
+    }
+  }
+
+  next();
+});
+
+// Track active connections per IP at the engine level.
+io.engine.on("connection", (engineSocket) => {
+  const ip = engineSocket.request
+    ? getClientIp(engineSocket.request)
+    : normalizeIp(engineSocket.remoteAddress);
+  connectionsPerIp.set(ip, (connectionsPerIp.get(ip) || 0) + 1);
+
+  engineSocket.on("close", () => {
+    const n = connectionsPerIp.get(ip);
+    if (n <= 1) connectionsPerIp.delete(ip);
+    else connectionsPerIp.set(ip, n - 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Room management
+// ---------------------------------------------------------------------------
+// In-memory room store: { roomId: { passwordHash, hostSocketId, createdAt, viewers } }
 const rooms = {};
 
-// Limite de tentativas de senha por socket (proteção contra força bruta)
+// Per-socket join attempt limit (brute-force protection).
 const MAX_JOIN_ATTEMPTS = 5;
-const joinAttempts = new Map(); // socket.id -> contagem
+const joinAttempts = new Map(); // socket.id -> attempt count
 
+// Chat rate limiting: one message per 500ms per socket.
+const lastMessageTime = new Map(); // socket.id -> timestamp
+
+/**
+ * Hashes a password using SHA-256.
+ * @param {string} password - Plain-text password.
+ * @returns {string} Hexadecimal hash.
+ */
 function hashPassword(password) {
   return crypto.createHash("sha256").update(password).digest("hex");
 }
 
+/**
+ * Generates a short, uppercase alphanumeric room ID (6 hex characters).
+ * @returns {string} Room ID, e.g., "7F3K9A".
+ */
 function generateRoomId() {
-  // ID curto, fácil de digitar (ex: 7F3K9A)
   return crypto.randomBytes(3).toString("hex").toUpperCase();
 }
 
+// ---- Input validation ----
+const ROOM_ID_RE = /^[0-9A-Fa-f]{6}$/;
+const MAX_PASSWORD_LENGTH = 64;
+
+/**
+ * Validates a room ID format.
+ * @param {any} value - Value to validate.
+ * @returns {boolean} True if valid.
+ */
+function isValidRoomId(value) {
+  return typeof value === "string" && ROOM_ID_RE.test(value.trim());
+}
+
+/**
+ * Validates a password length.
+ * @param {any} value - Value to validate.
+ * @param {Object} options - Options (min length).
+ * @param {number} options.min - Minimum length (default 4).
+ * @returns {boolean} True if valid.
+ */
+function isValidPassword(value, { min = 4 } = {}) {
+  return typeof value === "string" && value.length >= min && value.length <= MAX_PASSWORD_LENGTH;
+}
+
+/**
+ * Escapes HTML special characters to prevent XSS.
+ * @param {string} str - String to escape.
+ * @returns {string} Escaped string.
+ */
+function escapeHtml(str) {
+  return str.replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#039;");
+}
+
+// ---- Orphaned room sweeper ----
+function sweepRooms() {
+  const now = Date.now();
+  for (const [roomId, room] of Object.entries(rooms)) {
+    const hostConnected = io.sockets.sockets.has(room.hostSocketId);
+    if (hostConnected) continue;
+
+    if (room.hostLeftAt === undefined) {
+      room.hostLeftAt = now;
+      continue;
+    }
+    if (now - room.hostLeftAt >= ROOM_TTL_MS) {
+      io.to(roomId).emit("host-left");
+      delete rooms[roomId];
+      logSecurity("room-expired", { roomId, reason: "host-gone", idleMs: now - room.hostLeftAt });
+    }
+  }
+}
+setInterval(sweepRooms, ROOM_SWEEP_INTERVAL_MS);
+
 io.on("connection", (socket) => {
-  // HOST cria uma sala
-  socket.on("create-room", ({ password }, callback) => {
-    if (!password || password.length < 4) {
-      return callback({ ok: false, error: "Use uma senha com pelo menos 4 caracteres." });
+  // ----- HOST creates a room -----
+  socket.on("create-room", ({ password } = {}, callback) => {
+    if (typeof callback !== "function") return;
+    if (!isValidPassword(password)) {
+      return callback({ ok: false, error: "Password must be at least 4 characters (max 64)." });
     }
 
     let roomId = generateRoomId();
-    while (rooms[roomId]) roomId = generateRoomId(); // evita colisão
+    while (rooms[roomId]) roomId = generateRoomId();
 
     rooms[roomId] = {
       passwordHash: hashPassword(password),
       hostSocketId: socket.id,
       viewers: new Set(),
+      createdAt: Date.now(),
     };
 
     socket.join(roomId);
@@ -73,43 +316,59 @@ io.on("connection", (socket) => {
     callback({ ok: true, roomId });
   });
 
-  // VIEWER entra numa sala existente
-  socket.on("join-room", ({ roomId, password }, callback) => {
+  // ----- VIEWER joins an existing room -----
+  socket.on("join-room", ({ roomId, password } = {}, callback) => {
     const attempts = joinAttempts.get(socket.id) || 0;
     if (attempts >= MAX_JOIN_ATTEMPTS) {
+      logSecurity("join-attempts-exhausted", { socketId: socket.id, attempts });
       socket.disconnect(true);
       return;
     }
+    if (typeof callback !== "function") return;
 
-    const room = rooms[roomId];
+    if (!isValidRoomId(roomId)) {
+      joinAttempts.set(socket.id, attempts + 1);
+      return callback({ ok: false, error: "Invalid room ID format." });
+    }
+    if (!isValidPassword(password, { min: 1 })) {
+      joinAttempts.set(socket.id, attempts + 1);
+      return callback({ ok: false, error: "Invalid password." });
+    }
+
+    const normalizedRoomId = roomId.trim().toUpperCase();
+    const room = rooms[normalizedRoomId];
     if (!room) {
       joinAttempts.set(socket.id, attempts + 1);
-      return callback({ ok: false, error: "Sala não encontrada." });
+      return callback({ ok: false, error: "Room not found." });
     }
-    if (room.passwordHash !== hashPassword(password || "")) {
+    if (room.passwordHash !== hashPassword(password)) {
       joinAttempts.set(socket.id, attempts + 1);
-      return callback({ ok: false, error: "Senha incorreta." });
+      logSecurity("join-rejected", {
+        socketId: socket.id,
+        roomId: normalizedRoomId,
+        reason: "wrong-password",
+      });
+      return callback({ ok: false, error: "Incorrect password." });
     }
 
     joinAttempts.delete(socket.id);
-    socket.join(roomId);
-    socket.data.roomId = roomId;
+    socket.join(normalizedRoomId);
+    socket.data.roomId = normalizedRoomId;
     socket.data.isHost = false;
     room.viewers.add(socket.id);
 
-    // avisa o host que um novo viewer entrou, pra ele iniciar a conexão WebRTC
     socket.to(room.hostSocketId).emit("viewer-joined", { viewerId: socket.id });
 
     callback({ ok: true });
   });
 
-  // Troca de sinalização WebRTC (offer, answer, ice candidates)
-  // "to" é o socket.id do destinatário. Só é permitido entre host e viewer da MESMA sala,
-  // pra impedir que alguém injete sinalização em outra sala ou sequestre uma conexão alheia.
-  socket.on("signal", ({ to, data }) => {
+  // ----- WebRTC signaling -----
+  socket.on("signal", ({ to, data } = {}) => {
     const roomId = socket.data.roomId;
     const room = roomId && rooms[roomId];
     if (!room) return;
+
+    if (typeof to !== "string" || !data || typeof data !== "object") return;
 
     const isSenderHost = socket.data.isHost && room.hostSocketId === socket.id;
     const isSenderViewer = !socket.data.isHost && room.viewers.has(socket.id);
@@ -117,36 +376,68 @@ io.on("connection", (socket) => {
     const targetIsHost = to === room.hostSocketId;
     const targetIsViewer = room.viewers.has(to);
 
-    const allowed =
-      (isSenderHost && targetIsViewer) || (isSenderViewer && targetIsHost);
+    const allowed = (isSenderHost && targetIsViewer) || (isSenderViewer && targetIsHost);
 
     if (!allowed) return;
 
     io.to(to).emit("signal", { from: socket.id, data });
   });
 
+  // ----- Chat message -----
+  socket.on("chat-message", ({ message } = {}) => {
+    const roomId = socket.data.roomId;
+    if (!roomId) return; // not in a room
+
+    // Rate limiting: max 1 message per 500ms
+    const now = Date.now();
+    const last = lastMessageTime.get(socket.id) || 0;
+    if (now - last < 500) return;
+    lastMessageTime.set(socket.id, now);
+
+    // Validate length
+    if (typeof message !== "string" || message.length === 0 || message.length > 500) return;
+
+    // Sanitize HTML to prevent XSS
+    const sanitized = escapeHtml(message);
+
+    // Determine sender role for UI labeling
+    const role = socket.data.isHost ? "host" : "viewer";
+
+    // Broadcast to everyone in the room except the sender
+    socket.to(roomId).emit("chat-message", {
+      from: socket.id,
+      role: role,
+      message: sanitized,
+    });
+  });
+
+  // ----- Disconnect handling -----
   socket.on("disconnect", () => {
+    joinAttempts.delete(socket.id);
+    lastMessageTime.delete(socket.id);
+
     const roomId = socket.data.roomId;
     if (!roomId) return;
 
     if (socket.data.isHost) {
-      // host saiu: avisa todo mundo na sala e destrói a sala
       socket.to(roomId).emit("host-left");
       delete rooms[roomId];
     } else {
-      // viewer saiu: avisa o host
       const room = rooms[roomId];
       if (room) {
         room.viewers.delete(socket.id);
         io.to(room.hostSocketId).emit("viewer-left", { viewerId: socket.id });
       }
     }
-
-    joinAttempts.delete(socket.id);
   });
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Servidor rodando em http://localhost:${PORT}`);
-});
+// Start server only when executed directly.
+if (require.main === module) {
+  const PORT = process.env.PORT || 3000;
+  server.listen(PORT, () => {
+    console.log(`Server running at http://localhost:${PORT}`);
+  });
+}
+
+module.exports = { app, server, io, rooms, sweepRooms, securityEvents, logSecurity };
