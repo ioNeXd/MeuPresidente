@@ -1,0 +1,17 @@
+{
+  "name": "screen-share-poc",
+  "version": "1.0.0",
+  "description": "Compartilhamento de tela P2P via WebRTC, com sala protegida por ID + senha",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "helmet": "^7.1.0",
+    "socket.io": "^4.7.5"
+  }
+}
