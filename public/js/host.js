@@ -7,8 +7,6 @@ export class HostManager {
     this.socket = socket;
     this.state = state;
     this.peerConnections = {};
-    this.candidateBuffers = {};
-    this.iceDebouncers = {};
     this.recorder = null;
     this.statsMonitors = {};
     this.statsSamples = {};
@@ -29,6 +27,7 @@ export class HostManager {
     this.hostRoomInfo = document.getElementById('hostRoomInfo');
     this.btnCreateRoom = document.getElementById('btnCreateRoom');
     this.copyRoomIdBtn = document.getElementById('copyRoomIdBtn');
+    this.fpsButtons = document.querySelectorAll('.fps-btn');
 
     this.bindUI();
     this.bindSocketEvents();
@@ -105,6 +104,21 @@ export class HostManager {
         }
       });
     }
+
+    // FPS buttons
+    this.fpsButtons.forEach(btn => {
+      btn.addEventListener('click', () => {
+        this.fpsButtons.forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        const fps = parseInt(btn.dataset.fps, 10);
+        savePreference('fps', fps);
+        this.applyFps(fps);
+      });
+    });
+    const savedFps = loadPreference('fps', 60);
+    this.fpsButtons.forEach(b => {
+      b.classList.toggle('active', parseInt(b.dataset.fps, 10) === savedFps);
+    });
   }
 
   bindSocketEvents() {
@@ -203,6 +217,10 @@ export class HostManager {
     this.hostPreview.style.display = 'block';
     this.btnCreateRoom.disabled = true;
 
+    // Aplica o FPS salvo
+    const savedFps = loadPreference('fps', 60);
+    this.applyFps(savedFps);
+
     if (this.state.micGain) {
       this.hostMuteMic.classList.remove('hidden');
       this.hostMicVolume.classList.remove('hidden');
@@ -264,38 +282,35 @@ export class HostManager {
       iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
     });
     this.peerConnections[viewerId] = pc;
-    this.candidateBuffers[viewerId] = [];
-    this.iceDebouncers[viewerId] = debounce(() => {
-      this.emitIceCandidatesForViewer(viewerId);
-    }, 50);
 
-    this.startAdaptiveBitrate(viewerId);
-
-    this.state.localStream.getTracks().forEach(track => pc.addTrack(track, this.state.localStream));
-
-    pc.onnegotiationneeded = () => {
-      const bitrate = parseInt(this.bitrateSlider.value, 10) * 1000 || 500000;
-      setBitrateLimit(pc, bitrate);
-    };
-
+    // Enviar candidatos ICE imediatamente (sem buffer/debounce)
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        this.candidateBuffers[viewerId].push(event.candidate);
-        this.iceDebouncers[viewerId](viewerId);
+        this.socket.emit('signal', { to: viewerId, data: { candidate: event.candidate } });
       }
     };
 
+    // Aplicar bitrate e iniciar adaptive quando a conexão estiver pronta
     pc.oniceconnectionstatechange = () => {
       const stateStr = pc.iceConnectionState;
       console.log(`ICE state for viewer ${viewerId}: ${stateStr}`);
-      if (stateStr === 'failed' || stateStr === 'disconnected') {
+      if (stateStr === 'connected' || stateStr === 'completed') {
+        const bitrate = parseInt(this.bitrateSlider.value, 10) * 1000 || 500000;
+        setBitrateLimit(pc, bitrate);
+        this.startAdaptiveBitrate(viewerId);
+      } else if (stateStr === 'failed' || stateStr === 'disconnected') {
         setStatus(this.hostStatus, `Conexão com espectador ${viewerNumber} perdida.`, 'error');
       }
     };
 
+    // Adicionar tracks
+    this.state.localStream.getTracks().forEach(track => pc.addTrack(track, this.state.localStream));
+
+    // Criar offer e enviar
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     this.socket.emit('signal', { to: viewerId, data: { sdp: offer } });
+
     this.updateViewersList();
     showToast(`Espectador #${viewerNumber} entrou.`, 'info');
   }
@@ -304,19 +319,9 @@ export class HostManager {
     if (this.peerConnections[viewerId]) {
       cleanupPeerConnection(this.peerConnections[viewerId], false);
       delete this.peerConnections[viewerId];
-      delete this.candidateBuffers[viewerId];
-      delete this.iceDebouncers[viewerId];
       this.stopAdaptiveBitrate(viewerId);
     }
     this.updateViewersList();
-  }
-
-  emitIceCandidatesForViewer(viewerId) {
-    const candidates = this.candidateBuffers[viewerId] || [];
-    if (candidates.length === 0) return;
-    const toSend = candidates.slice();
-    this.candidateBuffers[viewerId] = [];
-    this.socket.emit('signal', { to: viewerId, data: { candidates: toSend } });
   }
 
   updateViewersList() {
@@ -336,6 +341,21 @@ export class HostManager {
         controller.current = Math.min(controller.current, bitrate);
       }
     });
+  }
+
+  // Aplica o FPS na track de vídeo via applyConstraints
+  applyFps(fps) {
+    if (!this.state.localStream) return;
+    const videoTrack = this.state.localStream.getVideoTracks()[0];
+    if (!videoTrack) return;
+    videoTrack.applyConstraints({ frameRate: { ideal: fps, max: fps } })
+      .then(() => {
+        showToast(`FPS definido para ${fps}`, 'success');
+      })
+      .catch(err => {
+        console.warn('applyConstraints FPS failed:', err);
+        showToast(`${fps} FPS não suportado nesta tela.`, 'error');
+      });
   }
 
   // ---------------------------------------------------------------------------
@@ -507,8 +527,6 @@ export class HostManager {
     setStatus(this.hostStatus, 'Compartilhamento encerrado.', 'error');
     Object.values(this.peerConnections).forEach(pc => cleanupPeerConnection(pc, false));
     this.peerConnections = {};
-    Object.keys(this.iceDebouncers).forEach(id => delete this.iceDebouncers[id]);
-    Object.keys(this.candidateBuffers).forEach(id => delete this.candidateBuffers[id]);
     Object.keys(this.adaptive).forEach(id => this.stopAdaptiveBitrate(id));
     this.updateViewersList();
     this.btnCreateRoom.disabled = false;

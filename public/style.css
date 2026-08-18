@@ -352,6 +352,51 @@ button.primary:disabled {
   cursor: pointer;
 }
 
+/* FPS control */
+.fps-control {
+  margin-top: 12px;
+}
+
+.fps-control label {
+  display: block;
+  font-size: 0.85rem;
+  font-weight: 500;
+  text-transform: none;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.fps-buttons {
+  display: flex;
+  gap: 6px;
+}
+
+.fps-btn {
+  flex: 1;
+  padding: 8px 0;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-color);
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.fps-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  border-color: var(--accent);
+}
+
+.fps-btn.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+  box-shadow: 0 2px 8px var(--accent-glow);
+}
+
 /* Botões de ação (gravar, estatísticas) */
 .action-row {
   display: flex;

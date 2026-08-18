@@ -1,6 +1,6 @@
 // viewer.js - Lógica do espectador
 
-import { debounce, setStatus, cleanupPeerConnection, savePreference, loadPreference, showToast } from './utils.js';
+import { setStatus, cleanupPeerConnection, savePreference, loadPreference, showToast } from './utils.js';
 
 export class ViewerManager {
   constructor(socket, state) {
@@ -8,8 +8,7 @@ export class ViewerManager {
     this.state = state;
     this.pc = null;
     this.hostSocketId = null;
-    this.candidateBuffer = [];
-    this.emitDebounce = debounce(() => this.sendCandidates(), 50);
+
     this.volumeSlider = document.getElementById('volumeSlider');
     this.muteBtn = document.getElementById('btnMute');
     this.video = document.getElementById('viewerVideo');
@@ -125,24 +124,26 @@ export class ViewerManager {
       setStatus(this.viewerStatus, 'Conectado. Aguardando vídeo...', 'ok');
       this.btnJoinRoom.disabled = true;
 
-      this.pc = new RTCPeerConnection({
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-      });
-      this.pc.ontrack = (event) => {
-        this.video.srcObject = event.streams[0];
-        this.video.style.display = 'block';
-        this.controls.classList.remove('hidden');
-        this.video.volume = parseFloat(this.volumeSlider.value);
-        setStatus(this.viewerStatus, 'Vídeo conectado!', 'ok');
-        showToast('Stream recebido!', 'success');
-      };
-      this.pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          this.candidateBuffer.push(event.candidate);
-          this.emitDebounce();
-        }
-      };
-      this.pc.oniceconnectionstatechange = () => {
+    this.pc = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+    });
+    this.pc.ontrack = (event) => {
+      this.video.srcObject = event.streams[0];
+      this.video.style.display = 'block';
+      this.controls.classList.remove('hidden');
+      this.video.volume = parseFloat(this.volumeSlider.value);
+      setStatus(this.viewerStatus, 'Vídeo conectado!', 'ok');
+      showToast('Stream recebido!', 'success');
+    };
+    this.pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        this.socket.emit('signal', {
+          to: this.hostSocketId,
+          data: { candidate: event.candidate },
+        });
+      }
+    };
+    this.pc.oniceconnectionstatechange = () => {
         const stateStr = this.pc.iceConnectionState;
         if (stateStr === 'connected') {
           setStatus(this.viewerStatus, 'Vídeo conectado.', 'ok');
@@ -155,16 +156,6 @@ export class ViewerManager {
       this.socket.emit('room-joined', { roomId });
       document.getElementById('chatToggle').classList.remove('hidden');
       document.getElementById('chatContainer').classList.remove('hidden');
-    });
-  }
-
-  sendCandidates() {
-    if (this.candidateBuffer.length === 0) return;
-    const toSend = this.candidateBuffer.slice();
-    this.candidateBuffer = [];
-    this.socket.emit('signal', {
-      to: this.hostSocketId,
-      data: { candidates: toSend },
     });
   }
 
