@@ -1,60 +1,158 @@
 #!/usr/bin/env bash
-# Screen Sharing - servidor local (Linux/macOS)
 set -e
-cd "$(dirname "$0")"
+
+# Cores
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+ok()   { echo -e "${GREEN}[OK]${NC} $1"; }
+warn() { echo -e "${YELLOW}[!]${NC} $1"; }
+fail() { echo -e "${RED}[X]${NC} $1"; }
+info() { echo -e "${CYAN}[*]${NC} $1"; }
 
 echo "============================================"
-echo " Screen Sharing - Servidor local"
+echo "   Screen Sharing - WebRTC P2P"
 echo "============================================"
-echo
+echo ""
 
-if ! command -v node >/dev/null 2>&1; then
-  echo "[ERRO] Node.js nao encontrado."
-  echo "Instale o Node.js LTS em https://nodejs.org e rode este script de novo."
-  exit 1
+# --- Detectar sistema ---
+OS="$(uname -s)"
+ARCH="$(uname -m)"
+
+# --- Verificar/instalar Node.js ---
+if ! command -v node &> /dev/null; then
+    warn "Node.js nao encontrado."
+    info "Instalando Node.js..."
+
+    if [ "$OS" = "Darwin" ]; then
+        if command -v brew &> /dev/null; then
+            brew install node
+        else
+            fail "Homebrew nao encontrado. Instale primeiro:"
+            echo '  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+            exit 1
+        fi
+    elif [ "$OS" = "Linux" ]; then
+        if command -v apt &> /dev/null; then
+            curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+            sudo apt-get install -y nodejs
+        elif command -v dnf &> /dev/null; then
+            curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo bash -
+            sudo dnf install -y nodejs
+        else
+            fail "Gerenciador de pacotes nao suportado."
+            echo "  Baixe manualmente: https://nodejs.org"
+            exit 1
+        fi
+    fi
+    ok "Node.js instalado."
+else
+    ok "Node.js encontrado ($(node --version))."
 fi
 
-if [ ! -d node_modules ]; then
-  echo "Instalando dependencias na primeira vez, pode demorar um pouco..."
-  npm install
+# --- Verificar/instalar cloudflared ---
+HAS_CLOUDFLARED=false
+if command -v cloudflared &> /dev/null; then
+    HAS_CLOUDFLARED=true
+    ok "cloudflared encontrado."
+else
+    warn "cloudflared nao encontrado."
+    info "Instalando cloudflared..."
+
+    if [ "$OS" = "Darwin" ]; then
+        if command -v brew &> /dev/null; then
+            brew install cloudflared
+            HAS_CLOUDFLARED=true
+        fi
+    elif [ "$OS" = "Linux" ]; then
+        ARCH_NAME="amd64"
+        [ "$ARCH" = "aarch64" ] && ARCH_NAME="arm64"
+        curl -L "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH_NAME}" -o /tmp/cloudflared
+        chmod +x /tmp/cloudflared
+        sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+        HAS_CLOUDFLARED=true
+    fi
+
+    if [ "$HAS_CLOUDFLARED" = true ]; then
+        ok "cloudflared instalado."
+    else
+        warn "cloudflared nao instalado."
+        warn "Sera possivel acessar apenas pela rede local."
+    fi
 fi
 
-# Descobre o IP local da rede (macOS: ipconfig getifaddr; Linux: hostname -I)
-# e valida que o resultado parece um IPv4 antes de usar.
-looks_like_ipv4() {
-  case "$1" in
-    [0-9]*.[0-9]*.[0-9]*.[0-9]*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-IP=""
-for iface in en0 en1 en2; do
-  IP="$(ipconfig getifaddr "$iface" 2>/dev/null || true)"
-  looks_like_ipv4 "$IP" && break
-  IP=""
-done
-if [ -z "$IP" ]; then
-  IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  looks_like_ipv4 "$IP" || IP=""
+# --- Instalar dependencias ---
+if [ ! -d "node_modules" ]; then
+    info "Instalando dependencias..."
+    npm install --omit=dev
+    ok "Dependencias instaladas."
 fi
-[ -z "$IP" ] && IP="IP_DA_MAQUINA"
 
-echo
-echo " Abra no SEU computador (para compartilhar a tela):"
-echo "   http://localhost:3000"
-echo
-echo " Amigos na MESMA rede Wi-Fi abrem:"
-echo "   http://${IP}:3000"
-echo
-echo " Para compartilhar pela INTERNET (qualquer rede), use um tunel HTTPS:"
-echo "   cloudflared tunnel --url http://localhost:3000"
-echo
-echo " IMPORTANTE: use sempre http://localhost:3000 para compartilhar a tela"
-echo " (o navegador bloqueia a captura fora de localhost/HTTPS)."
-echo
-echo " Pressione Ctrl+C para parar o servidor."
+# --- Detectar IP da rede ---
+LOCAL_IP=""
+if [ "$OS" = "Darwin" ]; then
+    LOCAL_IP=$(ipconfig getifaddr en0 2>/dev/null || echo "")
+elif [ "$OS" = "Linux" ]; then
+    LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "")
+fi
+# Validar IPv4
+if ! echo "$LOCAL_IP" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    LOCAL_IP=""
+fi
+
+echo ""
 echo "============================================"
-echo
+echo "   URLs de acesso"
+echo "============================================"
+echo ""
+echo "  Localhost:   http://localhost:3000"
+if [ -n "$LOCAL_IP" ]; then
+    echo "  Rede local:  http://${LOCAL_IP}:3000"
+fi
+echo ""
 
+# --- Iniciar cloudflared tunnel ---
+TUNNEL_URL=""
+if [ "$HAS_CLOUDFLARED" = true ]; then
+    info "Iniciando tunel HTTPS gratuito..."
+    cloudflared tunnel --url http://localhost:3000 &> /tmp/cloudflared.log &
+    CF_PID=$!
+
+    # Aguardar o link aparecer no log
+    for i in $(seq 1 15); do
+        sleep 1
+        TUNNEL_URL=$(grep -o 'https://[^ ]*trycloudflare[^ ]*' /tmp/cloudflared.log 2>/dev/null | head -1 || echo "")
+        if [ -n "$TUNNEL_URL" ]; then
+            break
+        fi
+    done
+
+    if [ -n "$TUNNEL_URL" ]; then
+        echo "  Internet:    ${TUNNEL_URL}"
+    else
+        warn "Tunel demorou para iniciar."
+    fi
+else
+    warn "cloudflared nao disponivel."
+    echo "  Para acesso pela internet, instale:"
+    echo "    brew install cloudflared"
+fi
+
+echo ""
+echo "============================================"
+echo "   Servidor iniciando..."
+echo "============================================"
+echo ""
+echo "  Pressione Ctrl+C para encerrar."
+echo ""
+
+# --- Iniciar servidor ---
 node server.js
+
+# Cleanup cloudflared ao sair
+if [ -n "$CF_PID" ]; then
+    kill "$CF_PID" 2>/dev/null || true
+fi

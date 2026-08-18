@@ -1,2 +1,8 @@
-# start.bat quebra no cmd.exe se sair do repo com line endings LF
-start.bat text eol=crlf
+* text=auto
+*.bat text eol=crlf
+*.sh text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.json text eol=lf
+*.md text eol=lf

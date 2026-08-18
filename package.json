@@ -1,6 +1,6 @@
 {
-  "name": "screen-share-poc",
-  "version": "2.0.0",
+  "name": "MeuPresidente",
+  "version": "1.0.0",
   "description": "WebRTC screen sharing P2P with advanced features",
   "main": "server.js",
   "bin": "server.js",
