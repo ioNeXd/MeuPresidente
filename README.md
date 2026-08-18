@@ -37,6 +37,13 @@ de criar a sala, validar a senha e trocar as informações iniciais de conexão 
 
 ## Rodar localmente
 
+**Caminho fácil (recomendado):** dê dois cliques no `start.bat` (Windows) ou
+rode `./start.sh` (Linux/macOS). O script verifica se o Node.js existe,
+instala as dependências na primeira vez, sobe o servidor e imprime os links
+prontos — `http://localhost:3000` e `http://IP_DA_REDE:3000`.
+
+**Manual:**
+
 ```bash
 npm install
 node server.js
@@ -44,6 +51,85 @@ node server.js
 
 Acesse `http://localhost:3000`. Para desenvolvimento com reload automático:
 `npm run dev` (nodemon).
+
+## Self-hosting: como os amigos alcançam seu servidor
+
+Quando o servidor roda na sua máquina (via `node server.js`, `start.bat`/
+`start.sh` ou o executável), existem 3 formas de os amigos chegarem até ele.
+
+### 1. Mesma rede Wi-Fi (LAN) — mais simples
+
+O host abre **`http://localhost:3000`** na própria máquina e os amigos, na
+mesma rede, abrem **`http://IP_DA_MAQUINA:3000`** — os scripts de início
+rápido já imprimem esse endereço. Para descobrir o IP manualmente:
+`ipconfig` (Windows) ou `ifconfig`/`ip addr` (Linux/macOS).
+
+> O host DEVE usar `localhost` (e não o IP) — veja "contexto seguro" abaixo.
+
+### 2. Internet com túnel HTTPS — recomendado para qualquer rede
+
+Exponha o servidor local com um túnel grátis e sem conta:
+
+```bash
+cloudflared tunnel --url http://localhost:3000
+```
+
+Ele gera um link tipo `https://xxx.trycloudflare.com`. Todo mundo (inclusive
+você, como host) abre esse link — funciona de qualquer rede, sem abrir porta
+no roteador, e o HTTPS garante que a captura de tela funcione para o host.
+
+### 3. Porta liberada no roteador — não recomendado
+
+Dá para liberar a porta 3000 no roteador e apontar um IP fixo/DDNS, mas o
+acesso vira `http://IP_PUBLICO:3000` (HTTP puro) — o navegador **bloqueia a
+captura de tela** fora de `localhost`/HTTPS, então o host continuaria
+dependendo de `localhost` na própria máquina. Mais frágil e menos seguro que
+o túnel; só vale se você já tem essa infraestrutura.
+
+### Por que `localhost` e HTTPS importam (contexto seguro)
+
+O navegador só permite `getDisplayMedia` (capturar a tela) em **contextos
+seguros**: `https://` ou `localhost`.
+
+- **Host por HTTP puro via IP não funciona** — a página abre, mas a captura
+  falha. Use `localhost` (mesma máquina) ou HTTPS (túnel/Render).
+- **Espectador não precisa de contexto seguro** — só recebe o vídeo; pode
+  entrar via `http://IP:3000` numa boa.
+- Rodando localmente sem `NODE_ENV=production`, os headers de segurança já
+  vêm relaxados (`ALLOW_INSECURE_ORIGIN` implícito), então HTTP/IP funciona
+  para os espectadores sem configuração extra.
+
+## Distribuição: executável único (sem precisar de Node)
+
+Dá para empacotar o servidor num executável que **não exige Node instalado**
+nos computadores de quem vai rodar (útil para distribuir entre amigos sem
+lotar um servidor central):
+
+```bash
+npm install
+npm run build
+```
+
+O comando gera executáveis em `dist/` para Windows (x64), Linux (x64) e
+macOS (Intel e Apple Silicon) — ~60 MB cada, com o front-end e o bundle do
+Socket.IO embutidos. Para gerar só a plataforma atual:
+
+```bash
+npx pkg . --targets node22-win-x64   # node22-linux-x64 / node22-macos-x64 / node22-macos-arm64
+```
+
+Para rodar: basta executar o binário (Windows: `screen-share-poc.exe`;
+Linux/macOS: `./screen-share-poc` — no macOS talvez seja preciso
+`chmod +x` e aceitar o aviso do Gatekeeper por ser não assinado). O
+servidor sobe na porta 3000 (ou `PORT`).
+
+Para as formas de os amigos alcançarem o servidor (LAN, túnel HTTPS ou
+porta liberada), veja a seção **Self-hosting** acima.
+
+> Nota: o `serveClient` do Socket.IO fica desligado; o bundle do client é
+> servido de memória em `/vendor/socket.io.js` — comportamento idêntico em
+> dev e no executável, e necessário porque o mecanismo original usa
+> `fs.createReadStream`, incompatível com o empacotamento.
 
 ## Deploy no Render (grátis, com HTTPS automático)
 

@@ -80,9 +80,23 @@ function computeAssetVersion() {
   const hash = crypto.createHash("sha1");
   const publicDir = path.join(__dirname, "public");
   const walk = (dir) => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    // withFileTypes pode não existir no filesystem virtual do executável
+    // empacotado (pkg) — cai para readdirSync + statSync nesse caso.
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true }).map((e) => ({
+        name: e.name,
+        isDirectory: e.isDirectory(),
+      }));
+    } catch (e) {
+      entries = fs.readdirSync(dir).map((name) => ({
+        name,
+        isDirectory: fs.statSync(path.join(dir, name)).isDirectory(),
+      }));
+    }
+    for (const entry of entries) {
       const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) walk(full);
+      if (entry.isDirectory) walk(full);
       else if (/\.(js|css)$/.test(entry.name)) hash.update(fs.readFileSync(full));
     }
   };
@@ -96,6 +110,44 @@ let indexHtml = fs
   .readFileSync(path.join(__dirname, "public", "index.html"), "utf8")
   .replace('href="/style.css"', `href="/style.css?v=${ASSET_VERSION}"`)
   .replace('src="/js/app.js"', `src="/js/app.js?v=${ASSET_VERSION}"`);
+
+// ---------------------------------------------------------------------------
+// Socket.IO client served from memory
+// ---------------------------------------------------------------------------
+// O socket.io padrão serve /socket.io/socket.io.js com fs.createReadStream de
+// um arquivo de node_modules — que não sobrevive ao empacotamento pkg. Então o
+// bundle é lido no boot (funciona tanto em dev quanto no executável) e servido
+// em /vendor/socket.io.js, fora do prefixo /socket.io que o engine.io intercepta.
+function resolveSocketIoClient() {
+  // Caminho determinístico: em dev é o node_modules do projeto; no executável
+  // pkg é o arquivo embutido via config "assets" (/.snapshot/node_modules/...).
+  const p = path.join(__dirname, "node_modules", "socket.io", "client-dist", "socket.io.js");
+  try {
+    return fs.existsSync(p) ? p : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+const SOCKET_IO_CLIENT_PATH = "/vendor/socket.io.js";
+const socketIoClientSource = (() => {
+  const p = resolveSocketIoClient();
+  if (!p) {
+    console.warn("[static] bundle do socket.io client não encontrado — /vendor/socket.io.js ficará indisponível");
+    return null;
+  }
+  return fs.readFileSync(p, "utf8");
+})();
+
+if (socketIoClientSource !== null) {
+  app.get(SOCKET_IO_CLIENT_PATH, (req, res) => {
+    res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+    // no-cache: o bundle é amarrado à versão do socket.io instalado, então
+    // revalidar é mais seguro do que cachear por muito tempo.
+    res.setHeader("Cache-Control", "no-cache");
+    res.send(socketIoClientSource);
+  });
+}
 
 app.get("/", (req, res) => {
   res.setHeader("Cache-Control", "no-cache");
@@ -132,7 +184,7 @@ app.get("/js/*.js", (req, res, next) => {
 });
 
 app.use(
-  express.static("public", {
+  express.static(path.join(__dirname, "public"), {
     etag: true,
     lastModified: true,
     setHeaders: (res, filePath) => {
@@ -151,6 +203,9 @@ app.use(
 // ---------------------------------------------------------------------------
 const io = new Server(server, {
   cors: APP_ORIGINS.length > 0 ? { origin: APP_ORIGINS, methods: ["GET", "POST"] } : false,
+  // O serveClient embutido usa fs.createReadStream num arquivo de node_modules
+  // que não é embutido no executável pkg — servimos o client nós mesmos, de memória.
+  serveClient: false,
 });
 
 const connectionsPerIp = new Map();

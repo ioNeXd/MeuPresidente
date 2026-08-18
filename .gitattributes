@@ -1,0 +1,2 @@
+# start.bat quebra no cmd.exe se sair do repo com line endings LF
+start.bat text eol=crlf
