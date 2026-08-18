@@ -43,6 +43,11 @@ body.light-mode {
   padding: 0;
 }
 
+/* Classe genérica para esconder elementos */
+.hidden {
+  display: none !important;
+}
+
 body {
   font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   background: var(--bg-primary);
