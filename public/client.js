@@ -6,7 +6,7 @@
  * - Socket.IO events: kebab-case.
  *
  * PERFORMANCE IMPROVEMENTS:
- * - ICE candidate debouncing.
+ * - ICE candidate debouncing (per‑viewer, to prevent lost candidates).
  * - Bitrate/bandwidth control.
  * - Strict cleanup of RTCPeerConnection.
  * - Cached static assets.
@@ -18,7 +18,7 @@
  *
  * CHAT FEATURES:
  * - Collapsible chat panel with message history.
- * - Messages are sanitized (server-side) and displayed with role labels.
+ * - Messages displayed safely (textContent, no XSS).
  * - Rate limiting (server-enforced).
  */
 
@@ -39,7 +39,7 @@ const state = {
   viewerVideo: null,
 
   // Chat
-  chatMessages: [], // array of { role, message }
+  chatMessages: [],
 
   // Shared
   socket: io(),
@@ -67,6 +67,22 @@ function debounce(func, wait) {
 function setStatus(el, msg, type) {
   el.textContent = msg;
   el.className = "status" + (type ? " " + type : "");
+}
+
+/**
+ * Returns the appropriate status element based on the current active tab.
+ * @returns {HTMLElement} hostStatus or viewerStatus.
+ */
+function getStatusElement() {
+  const hostPanel = document.getElementById("hostPanel");
+  const viewerPanel = document.getElementById("viewerPanel");
+  if (!hostPanel.classList.contains("hidden")) {
+    return document.getElementById("hostStatus");
+  } else if (!viewerPanel.classList.contains("hidden")) {
+    return document.getElementById("viewerStatus");
+  }
+  // Fallback: return hostStatus (should never happen)
+  return document.getElementById("hostStatus");
 }
 
 /**
@@ -146,17 +162,26 @@ chatToggle.onclick = () => {
 
 /**
  * Adds a message to the chat UI.
+ * Uses textContent to prevent XSS (safe).
  * @param {string} role - 'host' or 'viewer'
- * @param {string} message - Sanitized message text.
+ * @param {string} message - Message text (already sanitized on server, but we treat as text).
  */
 function addChatMessage(role, message) {
   const div = document.createElement("div");
   div.className = `chat-message ${role}`;
-  const label = role === "host" ? "👤 Host" : "👤 Viewer";
-  div.innerHTML = `<span class="chat-label">${label}:</span> <span class="chat-text">${message}</span>`;
+
+  const labelSpan = document.createElement("span");
+  labelSpan.className = "chat-label";
+  labelSpan.textContent = role === "host" ? "👤 Host:" : "👤 Viewer:";
+
+  const textSpan = document.createElement("span");
+  textSpan.className = "chat-text";
+  textSpan.textContent = message; // safe: textContent escapes HTML
+
+  div.appendChild(labelSpan);
+  div.appendChild(textSpan);
   chatMessages.appendChild(div);
   chatMessages.scrollTop = chatMessages.scrollHeight;
-  // Store in state (optional)
   state.chatMessages.push({ role, message });
 }
 
@@ -165,15 +190,13 @@ function sendChatMessage() {
   const text = chatInput.value.trim();
   if (!text) return;
   if (text.length > 500) {
-    setStatus(hostStatus, "Message too long (max 500 chars).", "error");
+    const statusEl = getStatusElement();
+    setStatus(statusEl, "Message too long (max 500 chars).", "error");
     return;
   }
   // Emit to server
   state.socket.emit("chat-message", { message: text });
   // Add locally immediately (optimistic)
-  const role = state.socket.data?.isHost ? "host" : "viewer"; // not reliable; we'll use our own flag
-  // Determine role from our state: we have isHost flag in host logic, but viewer doesn't have that.
-  // We'll store a local flag when joining.
   const localRole = window._isHost ? "host" : "viewer";
   addChatMessage(localRole, text);
   chatInput.value = "";
@@ -199,13 +222,20 @@ const hostPreview = document.getElementById("hostPreview");
 const viewersList = document.getElementById("viewersList");
 const hostEnableMic = document.getElementById("hostEnableMic");
 
-// Debounced ICE candidate emission
-const emitIceCandidates = debounce((viewerId, candidates) => {
+// Per‑viewer debounced ICE emission functions
+const iceDebouncers = {}; // viewerId -> debounced function
+const candidateBuffers = {}; // viewerId -> array of candidates
+
+/**
+ * Emits ICE candidates for a specific viewer (called by the debounced function).
+ * @param {string} viewerId
+ * @param {Array} candidates
+ */
+function emitIceCandidatesForViewer(viewerId, candidates) {
   if (candidates.length === 0) return;
   state.socket.emit("signal", { to: viewerId, data: { candidates } });
-}, 50);
-
-const candidateBuffers = {};
+  candidateBuffers[viewerId] = []; // clear buffer after sending
+}
 
 /**
  * Mixes a microphone track with the system audio track using AudioContext.
@@ -332,6 +362,9 @@ btnCreateRoom.onclick = async () => {
       setStatus(hostStatus, "Screen sharing ended.", "error");
       Object.values(state.peerConnections).forEach((pc) => cleanupPeerConnection(pc));
       state.peerConnections = {};
+      // Clean up debouncers and buffers
+      Object.keys(iceDebouncers).forEach((id) => delete iceDebouncers[id]);
+      Object.keys(candidateBuffers).forEach((id) => delete candidateBuffers[id]);
       updateViewersList();
       btnCreateRoom.disabled = false;
       if (state.audioContext) {
@@ -357,6 +390,16 @@ state.socket.on("viewer-joined", async ({ viewerId }) => {
   state.peerConnections[viewerId] = pc;
   candidateBuffers[viewerId] = [];
 
+  // Create a debounced emitter for this viewer
+  iceDebouncers[viewerId] = debounce((viewerId) => {
+    const candidates = candidateBuffers[viewerId] || [];
+    if (candidates.length > 0) {
+      state.socket.emit("signal", { to: viewerId, data: { candidates } });
+      candidateBuffers[viewerId] = [];
+    }
+  }, 50);
+
+  // Add local tracks
   state.localStream.getTracks().forEach((track) => pc.addTrack(track, state.localStream));
 
   pc.onnegotiationneeded = () => {
@@ -366,7 +409,7 @@ state.socket.on("viewer-joined", async ({ viewerId }) => {
   pc.onicecandidate = (event) => {
     if (event.candidate) {
       candidateBuffers[viewerId].push(event.candidate);
-      emitIceCandidates(viewerId, candidateBuffers[viewerId]);
+      iceDebouncers[viewerId](viewerId);
     }
   };
 
@@ -383,6 +426,7 @@ state.socket.on("viewer-left", ({ viewerId }) => {
     cleanupPeerConnection(state.peerConnections[viewerId]);
     delete state.peerConnections[viewerId];
     delete candidateBuffers[viewerId];
+    delete iceDebouncers[viewerId];
   }
   updateViewersList();
 });
@@ -597,9 +641,6 @@ state.socket.on("host-left", () => {
 // ----- Connection error -----
 state.socket.on("connect_error", () => {
   const msg = "Cannot connect to server. Check your network.";
-  if (!viewerPanel.classList.contains("hidden")) {
-    setStatus(viewerStatus, msg, "error");
-  } else {
-    setStatus(hostStatus, msg, "error");
-  }
+  const statusEl = getStatusElement();
+  setStatus(statusEl, msg, "error");
 });

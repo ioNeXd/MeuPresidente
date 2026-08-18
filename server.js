@@ -25,42 +25,28 @@ const helmet = require("helmet");
 // ---------------------------------------------------------------------------
 // Environment configuration
 // ---------------------------------------------------------------------------
-// In production (NODE_ENV=production, e.g., Render), strict security headers
-// (HSTS, upgrade-insecure-requests, COOP) are enabled by default. Set
-// ALLOW_INSECURE_ORIGIN=1 to relax them and allow access via plain IP/HTTP
-// (local testing via LAN, Radmin, etc.).
 const ALLOW_INSECURE_ORIGIN =
   process.env.ALLOW_INSECURE_ORIGIN === "1" || process.env.NODE_ENV !== "production";
 
-// Per-IP and total connection limits (basic DoS mitigation).
 const MAX_CONNECTIONS_PER_IP = parseInt(process.env.MAX_CONNECTIONS_PER_IP, 10) || 10;
 const MAX_TOTAL_CONNECTIONS = parseInt(process.env.MAX_TOTAL_CONNECTIONS, 10) || 200;
 
-// Orphaned room expiration (rooms without a connected host).
 const ROOM_TTL_MS = (parseFloat(process.env.ROOM_TTL_MINUTES) || 10) * 60 * 1000;
 const ROOM_SWEEP_INTERVAL_MS = parseInt(process.env.ROOM_SWEEP_INTERVAL_MS, 10) || 60 * 1000;
 
-// Allowed CORS origins (comma-separated). Empty = same-origin only.
 const APP_ORIGINS = (process.env.APP_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// Trust the X-Forwarded-For header (behind a proxy like Render). Never trust it
-// outside production, as it can be spoofed by the client.
 const TRUST_PROXY = process.env.TRUST_PROXY === "1" || process.env.NODE_ENV === "production";
 
 // ---------------------------------------------------------------------------
-// Security event logging (console + in-memory buffer; not exposed publicly)
+// Security event logging
 // ---------------------------------------------------------------------------
 const MAX_SECURITY_LOG = 200;
 const securityEvents = [];
 
-/**
- * Logs a security-related event.
- * @param {string} type - Event type (e.g., 'join-rejected', 'origin-rejected').
- * @param {Object} details - Additional context (IP, roomId, etc.).
- */
 function logSecurity(type, details = {}) {
   const entry = { type, at: new Date().toISOString(), ...details };
   securityEvents.push(entry);
@@ -74,9 +60,6 @@ const server = http.createServer(app);
 // ---------------------------------------------------------------------------
 // Security headers (helmet) — strict in production, relaxed for local testing.
 // ---------------------------------------------------------------------------
-// Note: upgradeInsecureRequests is intentionally removed in insecure mode.
-// In production behind true HTTPS (Render, etc.), it is enabled because the
-// connection is already HTTPS.
 const helmetConfig = {
   contentSecurityPolicy: {
     directives: {
@@ -88,7 +71,6 @@ const helmetConfig = {
       mediaSrc: ["'self'", "blob:"],
     },
   },
-  // undefined = default (enabled); false = disabled
   strictTransportSecurity: ALLOW_INSECURE_ORIGIN ? false : undefined,
   crossOriginOpenerPolicy: ALLOW_INSECURE_ORIGIN ? false : undefined,
 };
@@ -97,7 +79,7 @@ if (ALLOW_INSECURE_ORIGIN) {
 }
 app.use(helmet(helmetConfig));
 
-// Serve static files with caching (1 day max-age, ETag enabled)
+// Serve static files with caching
 app.use(
   express.static("public", {
     maxAge: "1d",
@@ -117,23 +99,12 @@ const io = new Server(server, {
   cors: APP_ORIGINS.length > 0 ? { origin: APP_ORIGINS, methods: ["GET", "POST"] } : false,
 });
 
-// ---- Connection tracking per IP ----
-const connectionsPerIp = new Map(); // ip -> active connection count
+const connectionsPerIp = new Map();
 
-/**
- * Normalizes an IP address (removes IPv6 prefix if present).
- * @param {string} addr - Raw address.
- * @returns {string} Normalized address.
- */
 function normalizeIp(addr) {
   return typeof addr === "string" ? addr.replace(/^::ffff:/, "") : "unknown";
 }
 
-/**
- * Extracts the client IP from the request, respecting TRUST_PROXY.
- * @param {http.IncomingMessage} req - Express request object.
- * @returns {string} Client IP address.
- */
 function getClientIp(req) {
   if (TRUST_PROXY) {
     const forwarded = req.headers["x-forwarded-for"];
@@ -144,20 +115,12 @@ function getClientIp(req) {
   return normalizeIp(req.socket && req.socket.remoteAddress);
 }
 
-/**
- * Helper to reject a handshake with a given status and message.
- * @param {http.ServerResponse} res - Response object.
- * @param {number} status - HTTP status code.
- * @param {string} message - Error message.
- */
 function rejectHandshake(res, status, message) {
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ error: message }));
 }
 
-// Socket.IO engine middleware (runs for polling and WebSocket upgrades).
 io.engine.use((req, res, next) => {
-  // 1) Origin validation: same-origin or explicit whitelist.
   const origin = req.headers.origin;
   if (origin) {
     const host = req.headers.host;
@@ -170,7 +133,6 @@ io.engine.use((req, res, next) => {
     }
   }
 
-  // 2) Connection limits — applied only on initial handshake (no sid).
   if (!req._query.sid) {
     const ip = getClientIp(req);
     const current = connectionsPerIp.get(ip) || 0;
@@ -190,7 +152,6 @@ io.engine.use((req, res, next) => {
   next();
 });
 
-// Track active connections per IP at the engine level.
 io.engine.on("connection", (engineSocket) => {
   const ip = engineSocket.request
     ? getClientIp(engineSocket.request)
@@ -207,53 +168,28 @@ io.engine.on("connection", (engineSocket) => {
 // ---------------------------------------------------------------------------
 // Room management
 // ---------------------------------------------------------------------------
-// In-memory room store: { roomId: { passwordHash, hostSocketId, createdAt, viewers } }
 const rooms = {};
-
-// Per-socket join attempt limit (brute-force protection).
 const MAX_JOIN_ATTEMPTS = 5;
-const joinAttempts = new Map(); // socket.id -> attempt count
+const joinAttempts = new Map();
 
 // Chat rate limiting: one message per 500ms per socket.
 const lastMessageTime = new Map(); // socket.id -> timestamp
 
-/**
- * Hashes a password using SHA-256.
- * @param {string} password - Plain-text password.
- * @returns {string} Hexadecimal hash.
- */
 function hashPassword(password) {
   return crypto.createHash("sha256").update(password).digest("hex");
 }
 
-/**
- * Generates a short, uppercase alphanumeric room ID (6 hex characters).
- * @returns {string} Room ID, e.g., "7F3K9A".
- */
 function generateRoomId() {
   return crypto.randomBytes(3).toString("hex").toUpperCase();
 }
 
-// ---- Input validation ----
 const ROOM_ID_RE = /^[0-9A-Fa-f]{6}$/;
 const MAX_PASSWORD_LENGTH = 64;
 
-/**
- * Validates a room ID format.
- * @param {any} value - Value to validate.
- * @returns {boolean} True if valid.
- */
 function isValidRoomId(value) {
   return typeof value === "string" && ROOM_ID_RE.test(value.trim());
 }
 
-/**
- * Validates a password length.
- * @param {any} value - Value to validate.
- * @param {Object} options - Options (min length).
- * @param {number} options.min - Minimum length (default 4).
- * @returns {boolean} True if valid.
- */
 function isValidPassword(value, { min = 4 } = {}) {
   return typeof value === "string" && value.length >= min && value.length <= MAX_PASSWORD_LENGTH;
 }
