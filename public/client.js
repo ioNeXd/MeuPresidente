@@ -36,6 +36,7 @@ const state = {
   isMicEnabled: false,
   micGain: null, // GainNode for microphone
   screenGain: null, // GainNode for system audio
+  isHost: false, // role flag (replaces window._isHost)
 
   // Viewer
   viewerPc: null,
@@ -211,7 +212,7 @@ function sendChatMessage() {
   // Emit to server
   state.socket.emit("chat-message", { message: text });
   // Add locally immediately (optimistic)
-  const localRole = window._isHost ? "host" : "viewer";
+  const localRole = state.isHost ? "host" : "viewer";
   const localNumber = state.viewerNumber;
   addChatMessage(localRole, localNumber, text);
   chatInput.value = "";
@@ -239,6 +240,7 @@ const hostEnableMic = document.getElementById("hostEnableMic");
 const hostMuteMic = document.getElementById("hostMuteMic");
 const hostMicVolume = document.getElementById("hostMicVolume");
 const hostMicVolumeLabel = document.getElementById("hostMicVolumeLabel");
+const copyRoomIdBtn = document.getElementById("copyRoomIdBtn");
 
 // Per‑viewer debounced ICE emission functions
 const iceDebouncers = {}; // viewerId -> debounced function
@@ -247,12 +249,14 @@ const candidateBuffers = {}; // viewerId -> array of candidates
 /**
  * Emits ICE candidates for a specific viewer (called by the debounced function).
  * @param {string} viewerId
- * @param {Array} candidates
  */
-function emitIceCandidatesForViewer(viewerId, candidates) {
+function emitIceCandidatesForViewer(viewerId) {
+  const candidates = candidateBuffers[viewerId] || [];
   if (candidates.length === 0) return;
-  state.socket.emit("signal", { to: viewerId, data: { candidates } });
-  candidateBuffers[viewerId] = []; // clear buffer after sending
+  // Copy and clear buffer atomically
+  const toSend = candidates.slice();
+  candidateBuffers[viewerId] = [];
+  state.socket.emit("signal", { to: viewerId, data: { candidates: toSend } });
 }
 
 /**
@@ -354,7 +358,7 @@ btnCreateRoom.onclick = async () => {
   }
 
   state.localStream = finalStream;
-  window._isHost = true; // flag for chat
+  state.isHost = true; // Set role flag
 
   hostPreview.srcObject = state.localStream;
   hostPreview.style.display = "block";
@@ -421,6 +425,7 @@ btnCreateRoom.onclick = async () => {
       hostMuteMic.classList.add("hidden");
       hostMicVolume.classList.add("hidden");
       hostMicVolumeLabel.classList.add("hidden");
+      state.isHost = false;
     };
   }
 };
@@ -450,6 +455,21 @@ hostMicVolume.addEventListener("input", () => {
   }
 });
 
+// ----- Host: copy room ID -----
+copyRoomIdBtn.onclick = () => {
+  const roomId = roomIdDisplay.textContent;
+  if (roomId) {
+    navigator.clipboard.writeText(roomId).then(() => {
+      setStatus(hostStatus, "Room ID copied!", "ok");
+      setTimeout(() => {
+        setStatus(hostStatus, "", "");
+      }, 2000);
+    }).catch(() => {
+      setStatus(hostStatus, "Failed to copy.", "error");
+    });
+  }
+};
+
 // ----- Host: viewer joined -----
 state.socket.on("viewer-joined", async ({ viewerId, viewerNumber }) => {
   const pc = new RTCPeerConnection({
@@ -459,12 +479,8 @@ state.socket.on("viewer-joined", async ({ viewerId, viewerNumber }) => {
   candidateBuffers[viewerId] = [];
 
   // Create a debounced emitter for this viewer
-  iceDebouncers[viewerId] = debounce((viewerId) => {
-    const candidates = candidateBuffers[viewerId] || [];
-    if (candidates.length > 0) {
-      state.socket.emit("signal", { to: viewerId, data: { candidates } });
-      candidateBuffers[viewerId] = [];
-    }
+  iceDebouncers[viewerId] = debounce(() => {
+    emitIceCandidatesForViewer(viewerId);
   }, 50);
 
   // Add local tracks
@@ -597,7 +613,7 @@ btnJoinRoom.onclick = () => {
     }
     setStatus(viewerStatus, "Connected. Waiting for host video...", "ok");
     btnJoinRoom.disabled = true;
-    window._isHost = false; // viewer flag for chat
+    state.isHost = false; // viewer flag for chat
 
     // Enable chat
     chatToggle.classList.remove("hidden");
@@ -630,11 +646,12 @@ btnJoinRoom.onclick = () => {
     const viewerCandidateBuffer = [];
     const emitViewerIce = debounce(() => {
       if (viewerCandidateBuffer.length === 0) return;
+      const toSend = viewerCandidateBuffer.slice();
+      viewerCandidateBuffer.length = 0;
       state.socket.emit("signal", {
         to: state.hostSocketId,
-        data: { candidates: viewerCandidateBuffer },
+        data: { candidates: toSend },
       });
-      viewerCandidateBuffer.length = 0;
     }, 50);
 
     state.viewerPc.onicecandidate = (event) => {
@@ -732,6 +749,7 @@ state.socket.on("host-left", () => {
   chatToggle.classList.add("hidden");
   chatContainer.classList.add("hidden");
   chatVisible = false;
+  state.isHost = false;
 });
 
 // ----- Connection error -----
@@ -739,4 +757,12 @@ state.socket.on("connect_error", () => {
   const msg = "Cannot connect to server. Check your network.";
   const statusEl = getStatusElement();
   setStatus(statusEl, msg, "error");
+});
+
+// ----- Cleanup on socket disconnect (host) -----
+state.socket.on("disconnect", () => {
+  if (state.isHost && state.audioContext) {
+    state.audioContext.close();
+    state.audioContext = null;
+  }
 });

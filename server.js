@@ -219,9 +219,12 @@ function sweepRooms() {
       continue;
     }
     if (now - room.hostLeftAt >= ROOM_TTL_MS) {
-      io.to(roomId).emit("host-left");
-      delete rooms[roomId];
-      logSecurity("room-expired", { roomId, reason: "host-gone", idleMs: now - room.hostLeftAt });
+      // Verifica se a sala ainda existe antes de emitir
+      if (rooms[roomId]) {
+        io.to(roomId).emit("host-left");
+        delete rooms[roomId];
+        logSecurity("room-expired", { roomId, reason: "host-gone", idleMs: now - room.hostLeftAt });
+      }
     }
   }
 }
