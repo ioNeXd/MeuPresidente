@@ -242,6 +242,8 @@ io.on("connection", (socket) => {
       passwordHash: hashPassword(password),
       hostSocketId: socket.id,
       viewers: new Set(),
+      viewerNumbers: new Map(), // socket.id -> number
+      viewerCounter: 0,
       createdAt: Date.now(),
     };
 
@@ -291,9 +293,18 @@ io.on("connection", (socket) => {
     socket.join(normalizedRoomId);
     socket.data.roomId = normalizedRoomId;
     socket.data.isHost = false;
-    room.viewers.add(socket.id);
 
-    socket.to(room.hostSocketId).emit("viewer-joined", { viewerId: socket.id });
+    // Assign viewer number
+    room.viewerCounter += 1;
+    const viewerNumber = room.viewerCounter;
+    room.viewers.add(socket.id);
+    room.viewerNumbers.set(socket.id, viewerNumber);
+
+    // Notify host
+    socket.to(room.hostSocketId).emit("viewer-joined", {
+      viewerId: socket.id,
+      viewerNumber: viewerNumber,
+    });
 
     callback({ ok: true });
   });
@@ -336,13 +347,23 @@ io.on("connection", (socket) => {
     // Sanitize HTML to prevent XSS
     const sanitized = escapeHtml(message);
 
-    // Determine sender role for UI labeling
-    const role = socket.data.isHost ? "host" : "viewer";
+    // Determine sender info
+    const room = rooms[roomId];
+    if (!room) return;
+
+    let role = "viewer";
+    let viewerNumber = null;
+    if (socket.data.isHost) {
+      role = "host";
+    } else {
+      viewerNumber = room.viewerNumbers.get(socket.id) || null;
+    }
 
     // Broadcast to everyone in the room except the sender
     socket.to(roomId).emit("chat-message", {
       from: socket.id,
       role: role,
+      viewerNumber: viewerNumber,
       message: sanitized,
     });
   });
@@ -362,6 +383,7 @@ io.on("connection", (socket) => {
       const room = rooms[roomId];
       if (room) {
         room.viewers.delete(socket.id);
+        room.viewerNumbers.delete(socket.id);
         io.to(room.hostSocketId).emit("viewer-left", { viewerId: socket.id });
       }
     }

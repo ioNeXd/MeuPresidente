@@ -95,6 +95,36 @@
   }
   .volume-control .mute-btn:hover { color: #3b5bfd; }
 
+  /* Host audio controls */
+  .host-audio-controls {
+    margin-top: 12px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+  }
+  .host-audio-controls .ctrl-btn {
+    padding: 6px 12px;
+    font-size: 0.85rem;
+  }
+  .host-audio-controls label {
+    margin: 0;
+    font-size: 0.85rem;
+    color: #b7bcc7;
+  }
+  .host-audio-controls input[type="range"] {
+    width: 80px;
+    accent-color: #3b5bfd;
+    background: transparent;
+  }
+  .host-audio-controls .volume-label {
+    min-width: 30px;
+    text-align: center;
+    font-size: 0.85rem;
+    color: #b7bcc7;
+  }
+  .host-audio-controls .hidden { display: none; }
+
   /* Chat */
   #chatToggle {
     background: none; border: 1px solid #2a2e38; border-radius: 8px;
@@ -208,6 +238,14 @@
     </div>
 
     <button class="primary" id="btnCreateRoom">Start sharing</button>
+
+    <!-- Host audio controls (hidden initially) -->
+    <div class="host-audio-controls">
+      <button class="ctrl-btn hidden" id="hostMuteMic">🔊 Mute Mic</button>
+      <label class="hidden" for="hostMicVolume">Mic gain</label>
+      <input type="range" id="hostMicVolume" min="0" max="1" step="0.01" value="0.8" class="hidden" />
+      <span class="volume-label hidden" id="hostMicVolumeLabel">0.80</span>
+    </div>
 
     <div class="room-info hidden" id="hostRoomInfo">
       Room ID: <b id="roomIdDisplay"></b>

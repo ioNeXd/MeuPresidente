@@ -15,11 +15,13 @@
  * - System audio capture.
  * - Microphone mixing via AudioContext.
  * - Volume control and mute on viewer side.
+ * - Host: mute/unmute microphone, microphone gain slider.
  *
  * CHAT FEATURES:
  * - Collapsible chat panel with message history.
  * - Messages displayed safely (textContent, no XSS).
  * - Rate limiting (server-enforced).
+ * - Viewer numbering (e.g., "Viewer #3").
  */
 
 // ================================================================
@@ -32,6 +34,8 @@ const state = {
   audioContext: null,
   micStream: null,
   isMicEnabled: false,
+  micGain: null, // GainNode for microphone
+  screenGain: null, // GainNode for system audio
 
   // Viewer
   viewerPc: null,
@@ -40,6 +44,7 @@ const state = {
 
   // Chat
   chatMessages: [],
+  viewerNumber: null, // assigned by server
 
   // Shared
   socket: io(),
@@ -86,10 +91,11 @@ function getStatusElement() {
 }
 
 /**
- * Cleans up a RTCPeerConnection: closes it and removes all event listeners.
+ * Cleans up a RTCPeerConnection: closes it and optionally stops tracks.
  * @param {RTCPeerConnection} pc - The peer connection to clean.
+ * @param {boolean} stopTracks - Whether to stop the tracks (default true).
  */
-function cleanupPeerConnection(pc) {
+function cleanupPeerConnection(pc, stopTracks = true) {
   if (!pc) return;
   pc.onicecandidate = null;
   pc.ontrack = null;
@@ -97,9 +103,11 @@ function cleanupPeerConnection(pc) {
   pc.oniceconnectionstatechange = null;
   pc.onsignalingstatechange = null;
   pc.close();
-  pc.getSenders().forEach((sender) => {
-    if (sender.track) sender.track.stop();
-  });
+  if (stopTracks) {
+    pc.getSenders().forEach((sender) => {
+      if (sender.track) sender.track.stop();
+    });
+  }
 }
 
 /**
@@ -164,15 +172,21 @@ chatToggle.onclick = () => {
  * Adds a message to the chat UI.
  * Uses textContent to prevent XSS (safe).
  * @param {string} role - 'host' or 'viewer'
- * @param {string} message - Message text (already sanitized on server, but we treat as text).
+ * @param {number|null} viewerNumber - Viewer number (if role === 'viewer')
+ * @param {string} message - Message text (already sanitized on server).
  */
-function addChatMessage(role, message) {
+function addChatMessage(role, viewerNumber, message) {
   const div = document.createElement("div");
   div.className = `chat-message ${role}`;
 
   const labelSpan = document.createElement("span");
   labelSpan.className = "chat-label";
-  labelSpan.textContent = role === "host" ? "👤 Host:" : "👤 Viewer:";
+  if (role === "host") {
+    labelSpan.textContent = "👤 Host:";
+  } else {
+    const num = viewerNumber !== null ? ` #${viewerNumber}` : "";
+    labelSpan.textContent = `👤 Viewer${num}:`;
+  }
 
   const textSpan = document.createElement("span");
   textSpan.className = "chat-text";
@@ -182,7 +196,7 @@ function addChatMessage(role, message) {
   div.appendChild(textSpan);
   chatMessages.appendChild(div);
   chatMessages.scrollTop = chatMessages.scrollHeight;
-  state.chatMessages.push({ role, message });
+  state.chatMessages.push({ role, viewerNumber, message });
 }
 
 // Send chat message
@@ -198,7 +212,8 @@ function sendChatMessage() {
   state.socket.emit("chat-message", { message: text });
   // Add locally immediately (optimistic)
   const localRole = window._isHost ? "host" : "viewer";
-  addChatMessage(localRole, text);
+  const localNumber = state.viewerNumber;
+  addChatMessage(localRole, localNumber, text);
   chatInput.value = "";
   chatInput.focus();
 }
@@ -221,6 +236,9 @@ const hostStatus = document.getElementById("hostStatus");
 const hostPreview = document.getElementById("hostPreview");
 const viewersList = document.getElementById("viewersList");
 const hostEnableMic = document.getElementById("hostEnableMic");
+const hostMuteMic = document.getElementById("hostMuteMic");
+const hostMicVolume = document.getElementById("hostMicVolume");
+const hostMicVolumeLabel = document.getElementById("hostMicVolumeLabel");
 
 // Per‑viewer debounced ICE emission functions
 const iceDebouncers = {}; // viewerId -> debounced function
@@ -239,6 +257,7 @@ function emitIceCandidatesForViewer(viewerId, candidates) {
 
 /**
  * Mixes a microphone track with the system audio track using AudioContext.
+ * Returns an object with the mixed stream and gain nodes for control.
  */
 async function mixAudioStreams(screenStream, micStream) {
   if (!state.audioContext) {
@@ -252,7 +271,7 @@ async function mixAudioStreams(screenStream, micStream) {
   const screenGain = ctx.createGain();
   screenGain.gain.value = 1.0;
   const micGain = ctx.createGain();
-  micGain.gain.value = 0.8;
+  micGain.gain.value = 0.8; // default
 
   screenSource.connect(screenGain);
   micSource.connect(micGain);
@@ -267,7 +286,13 @@ async function mixAudioStreams(screenStream, micStream) {
   const videoTracks = screenStream.getVideoTracks();
   const audioTracks = dest.stream.getAudioTracks();
 
-  return new MediaStream([...videoTracks, ...audioTracks]);
+  const mixedStream = new MediaStream([...videoTracks, ...audioTracks]);
+
+  // Store gain nodes for later control
+  state.screenGain = screenGain;
+  state.micGain = micGain;
+
+  return mixedStream;
 }
 
 btnCreateRoom.onclick = async () => {
@@ -335,6 +360,20 @@ btnCreateRoom.onclick = async () => {
   hostPreview.style.display = "block";
   btnCreateRoom.disabled = true;
 
+  // Enable mic controls
+  if (state.micGain) {
+    hostMuteMic.classList.remove("hidden");
+    hostMicVolume.classList.remove("hidden");
+    hostMicVolumeLabel.classList.remove("hidden");
+    hostMuteMic.textContent = "🔊 Mute Mic";
+    hostMicVolume.value = state.micGain.gain.value;
+    hostMicVolumeLabel.textContent = state.micGain.gain.value.toFixed(2);
+  } else {
+    hostMuteMic.classList.add("hidden");
+    hostMicVolume.classList.add("hidden");
+    hostMicVolumeLabel.classList.add("hidden");
+  }
+
   state.socket.emit("create-room", { password }, (res) => {
     if (!res.ok) {
       setStatus(hostStatus, "Failed to create room.", "error");
@@ -360,7 +399,7 @@ btnCreateRoom.onclick = async () => {
   if (videoTrack) {
     videoTrack.onended = () => {
       setStatus(hostStatus, "Screen sharing ended.", "error");
-      Object.values(state.peerConnections).forEach((pc) => cleanupPeerConnection(pc));
+      Object.values(state.peerConnections).forEach((pc) => cleanupPeerConnection(pc, false));
       state.peerConnections = {};
       // Clean up debouncers and buffers
       Object.keys(iceDebouncers).forEach((id) => delete iceDebouncers[id]);
@@ -378,12 +417,41 @@ btnCreateRoom.onclick = async () => {
       chatToggle.classList.add("hidden");
       chatContainer.classList.add("hidden");
       chatVisible = false;
+      // Hide mic controls
+      hostMuteMic.classList.add("hidden");
+      hostMicVolume.classList.add("hidden");
+      hostMicVolumeLabel.classList.add("hidden");
     };
   }
 };
 
+// ----- Host: mute/unmute microphone -----
+hostMuteMic.onclick = () => {
+  if (!state.micGain) return;
+  const current = state.micGain.gain.value;
+  if (current > 0) {
+    state.micGain.gain.value = 0;
+    hostMuteMic.textContent = "🔇 Unmute Mic";
+  } else {
+    state.micGain.gain.value = parseFloat(hostMicVolume.value) || 0.8;
+    hostMuteMic.textContent = "🔊 Mute Mic";
+  }
+};
+
+// ----- Host: microphone volume slider -----
+hostMicVolume.addEventListener("input", () => {
+  if (!state.micGain) return;
+  const val = parseFloat(hostMicVolume.value);
+  state.micGain.gain.value = val;
+  hostMicVolumeLabel.textContent = val.toFixed(2);
+  // If gain > 0 and mute button says "Unmute", update text
+  if (val > 0 && hostMuteMic.textContent === "🔇 Unmute Mic") {
+    hostMuteMic.textContent = "🔊 Mute Mic";
+  }
+});
+
 // ----- Host: viewer joined -----
-state.socket.on("viewer-joined", async ({ viewerId }) => {
+state.socket.on("viewer-joined", async ({ viewerId, viewerNumber }) => {
   const pc = new RTCPeerConnection({
     iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
   });
@@ -413,6 +481,15 @@ state.socket.on("viewer-joined", async ({ viewerId }) => {
     }
   };
 
+  // ICE connection state monitoring
+  pc.oniceconnectionstatechange = () => {
+    const stateStr = pc.iceConnectionState;
+    console.log(`ICE state for viewer ${viewerId}: ${stateStr}`);
+    if (stateStr === "failed" || stateStr === "disconnected") {
+      setStatus(hostStatus, `Connection to viewer ${viewerNumber} lost.`, "error");
+    }
+  };
+
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
   state.socket.emit("signal", { to: viewerId, data: { sdp: offer } });
@@ -423,7 +500,7 @@ state.socket.on("viewer-joined", async ({ viewerId }) => {
 // ----- Host: viewer left -----
 state.socket.on("viewer-left", ({ viewerId }) => {
   if (state.peerConnections[viewerId]) {
-    cleanupPeerConnection(state.peerConnections[viewerId]);
+    cleanupPeerConnection(state.peerConnections[viewerId], false); // do NOT stop tracks
     delete state.peerConnections[viewerId];
     delete candidateBuffers[viewerId];
     delete iceDebouncers[viewerId];
@@ -539,6 +616,17 @@ btnJoinRoom.onclick = () => {
       viewerVideo.volume = parseFloat(volumeSlider.value);
     };
 
+    // ICE connection state monitoring
+    state.viewerPc.oniceconnectionstatechange = () => {
+      const stateStr = state.viewerPc.iceConnectionState;
+      console.log(`Viewer ICE state: ${stateStr}`);
+      if (stateStr === "connected") {
+        setStatus(viewerStatus, "Video stream connected.", "ok");
+      } else if (stateStr === "failed" || stateStr === "disconnected") {
+        setStatus(viewerStatus, "Connection lost. Trying to reconnect...", "error");
+      }
+    };
+
     const viewerCandidateBuffer = [];
     const emitViewerIce = debounce(() => {
       if (viewerCandidateBuffer.length === 0) return;
@@ -575,7 +663,9 @@ state.socket.on("signal", async ({ from, data }) => {
     for (const candidate of data.candidates) {
       try {
         await state.viewerPc.addIceCandidate(candidate);
-      } catch (e) {}
+      } catch (e) {
+        console.warn("Failed to add ICE candidate (viewer):", e);
+      }
     }
     return;
   }
@@ -593,7 +683,9 @@ state.socket.on("signal", async ({ from, data }) => {
     for (const candidate of data.candidates) {
       try {
         await state.peerConnections[from].addIceCandidate(candidate);
-      } catch (e) {}
+      } catch (e) {
+        console.warn("Failed to add ICE candidate (host):", e);
+      }
     }
     return;
   }
@@ -602,20 +694,24 @@ state.socket.on("signal", async ({ from, data }) => {
   if (state.viewerPc && data.candidate) {
     try {
       await state.viewerPc.addIceCandidate(data.candidate);
-    } catch (e) {}
+    } catch (e) {
+      console.warn("Failed to add single ICE candidate (viewer):", e);
+    }
     return;
   }
   if (state.peerConnections[from] && data.candidate) {
     try {
       await state.peerConnections[from].addIceCandidate(data.candidate);
-    } catch (e) {}
+    } catch (e) {
+      console.warn("Failed to add single ICE candidate (host):", e);
+    }
     return;
   }
 });
 
 // ----- Chat messages received from server -----
-state.socket.on("chat-message", ({ role, message }) => {
-  addChatMessage(role, message);
+state.socket.on("chat-message", ({ role, viewerNumber, message }) => {
+  addChatMessage(role, viewerNumber, message);
 });
 
 // ----- Host left -----
@@ -628,7 +724,7 @@ state.socket.on("host-left", () => {
   btnJoinRoom.disabled = false;
 
   if (state.viewerPc) {
-    cleanupPeerConnection(state.viewerPc);
+    cleanupPeerConnection(state.viewerPc, true);
     state.viewerPc = null;
     state.hostSocketId = null;
   }
