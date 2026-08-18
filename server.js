@@ -1,19 +1,5 @@
 /**
  * server.js - WebRTC Signaling Server with room management and security.
- *
- * NAMING CONVENTIONS:
- * - Variables, functions, and methods: camelCase (e.g., `roomId`, `generateRoomId`).
- * - Socket.IO event names: kebab-case (e.g., `create-room`, `join-room`, `viewer-joined`).
- * - Environment variables: UPPER_SNAKE_CASE (e.g., `MAX_CONNECTIONS_PER_IP`).
- *
- * SECURITY FEATURES:
- * - Per-IP and total connection limits.
- * - Orphaned room expiration (TTL).
- * - Input validation (roomId format, password length).
- * - Conditional HSTS/COOP headers via `ALLOW_INSECURE_ORIGIN`.
- * - Explicit CORS configuration for Socket.IO.
- * - Security event logging (in-memory buffer with console output).
- * - Chat: rate limiting (500ms cooldown), max length 500 chars, HTML escaping.
  */
 
 const express = require("express");
@@ -21,6 +7,8 @@ const http = require("http");
 const { Server } = require("socket.io");
 const crypto = require("crypto");
 const helmet = require("helmet");
+const fs = require("fs");
+const path = require("path");
 
 // ---------------------------------------------------------------------------
 // Environment configuration
@@ -28,11 +16,11 @@ const helmet = require("helmet");
 const ALLOW_INSECURE_ORIGIN =
   process.env.ALLOW_INSECURE_ORIGIN === "1" || process.env.NODE_ENV !== "production";
 
-const MAX_CONNECTIONS_PER_IP = parseInt(process.env.MAX_CONNECTIONS_PER_IP, 10) || 10;
-const MAX_TOTAL_CONNECTIONS = parseInt(process.env.MAX_TOTAL_CONNECTIONS, 10) || 200;
+const MAX_CONNECTIONS_PER_IP = Number(process.env.MAX_CONNECTIONS_PER_IP) || 10;
+const MAX_TOTAL_CONNECTIONS = Number(process.env.MAX_TOTAL_CONNECTIONS) || 200;
 
-const ROOM_TTL_MS = (parseFloat(process.env.ROOM_TTL_MINUTES) || 10) * 60 * 1000;
-const ROOM_SWEEP_INTERVAL_MS = parseInt(process.env.ROOM_SWEEP_INTERVAL_MS, 10) || 60 * 1000;
+const ROOM_TTL_MS = (Number(process.env.ROOM_TTL_MINUTES) || 10) * 60 * 1000;
+const ROOM_SWEEP_INTERVAL_MS = Number(process.env.ROOM_SWEEP_INTERVAL_MS) || 60 * 1000;
 
 const APP_ORIGINS = (process.env.APP_ORIGINS || "")
   .split(",")
@@ -58,35 +46,101 @@ const app = express();
 const server = http.createServer(app);
 
 // ---------------------------------------------------------------------------
-// Security headers (helmet) — strict in production, relaxed for local testing.
+// Security headers (helmet)
 // ---------------------------------------------------------------------------
+const cspDirectives = {
+  defaultSrc: ["'self'"],
+  scriptSrc: ["'self'"],
+  connectSrc: ["'self'", "ws:", "wss:"],
+  imgSrc: ["'self'", "data:"],
+  styleSrc: ["'self'", "'unsafe-inline'"],
+  mediaSrc: ["'self'", "blob:"],
+};
+
+if (!ALLOW_INSECURE_ORIGIN) {
+  cspDirectives.upgradeInsecureRequests = [];
+}
+
 const helmetConfig = {
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc: ["'self'"],
-      connectSrc: ["'self'", "ws:", "wss:"],
-      imgSrc: ["'self'", "data:"],
-      styleSrc: ["'self'", "'unsafe-inline'"],
-      mediaSrc: ["'self'", "blob:"],
-    },
-  },
+  contentSecurityPolicy: { directives: cspDirectives },
   strictTransportSecurity: ALLOW_INSECURE_ORIGIN ? false : undefined,
   crossOriginOpenerPolicy: ALLOW_INSECURE_ORIGIN ? false : undefined,
 };
-if (ALLOW_INSECURE_ORIGIN) {
-  helmetConfig.contentSecurityPolicy.directives.upgradeInsecureRequests = null;
-}
+
 app.use(helmet(helmetConfig));
 
-// Serve static files with caching
+// ---------------------------------------------------------------------------
+// Static files with content-based cache busting
+// ---------------------------------------------------------------------------
+// index.html é servido de memória com URLs versionadas (?v=<hash do conteúdo>)
+// e Cache-Control: no-cache, então o navegador sempre baixa o HTML fresco — mas
+// os assets .js/.css (que mudam de URL a cada deploy) podem ser cacheados por
+// 1 ano com `immutable`, evitando recarregar tudo a cada deploy.
+function computeAssetVersion() {
+  const hash = crypto.createHash("sha1");
+  const publicDir = path.join(__dirname, "public");
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (/\.(js|css)$/.test(entry.name)) hash.update(fs.readFileSync(full));
+    }
+  };
+  walk(publicDir);
+  return hash.digest("hex").slice(0, 8);
+}
+
+const ASSET_VERSION = computeAssetVersion();
+
+let indexHtml = fs
+  .readFileSync(path.join(__dirname, "public", "index.html"), "utf8")
+  .replace('href="/style.css"', `href="/style.css?v=${ASSET_VERSION}"`)
+  .replace('src="/js/app.js"', `src="/js/app.js?v=${ASSET_VERSION}"`);
+
+app.get("/", (req, res) => {
+  res.setHeader("Cache-Control", "no-cache");
+  res.send(indexHtml);
+});
+
+// Os módulos ES importam entre si com caminhos relativos (ex: './utils.js').
+// Sem um build step, esses imports não receberiam o ?v= do entry point e o
+// navegador poderia servir módulos antigos do cache imutável após um deploy.
+// Este middleware reescreve os imports relativos na resposta, adicionando o
+// mesmo versionamento — assim TODOS os assets mudam de URL quando o conteúdo muda.
+const moduleTransformCache = new Map();
+
+app.get("/js/*.js", (req, res, next) => {
+  const publicDir = path.join(__dirname, "public");
+  const filePath = path.resolve(publicDir, req.path.replace(/^\/+/, ""));
+  if (!filePath.startsWith(path.join(publicDir, "js") + path.sep)) {
+    return next(); // fora de public/js — deixa o express.static decidir
+  }
+  if (moduleTransformCache.has(filePath)) {
+    res.setHeader("Cache-Control", req.query.v ? "public, max-age=31536000, immutable" : "no-cache");
+    return res.type("application/javascript").send(moduleTransformCache.get(filePath));
+  }
+  fs.readFile(filePath, "utf8", (err, source) => {
+    if (err) return next();
+    const transformed = source.replace(
+      /from\s+(['"])(\.\/[^'"]+)\1/g,
+      (match, quote, spec) => `from ${quote}${spec}?v=${ASSET_VERSION}${quote}`
+    );
+    moduleTransformCache.set(filePath, transformed);
+    res.setHeader("Cache-Control", req.query.v ? "public, max-age=31536000, immutable" : "no-cache");
+    res.type("application/javascript").send(transformed);
+  });
+});
+
 app.use(
   express.static("public", {
-    maxAge: "1d",
     etag: true,
-    setHeaders: (res, path) => {
-      if (path.includes("client.js") || path.includes("style.css")) {
-        res.setHeader("Cache-Control", "public, max-age=86400");
+    lastModified: true,
+    setHeaders: (res, filePath) => {
+      if (filePath.endsWith(".js") || filePath.endsWith(".css")) {
+        // URLs versionadas (?v=...): seguro cachear agressivamente.
+        res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+      } else {
+        res.setHeader("Cache-Control", "no-cache");
       }
     },
   })
@@ -160,6 +214,7 @@ io.engine.on("connection", (engineSocket) => {
 
   engineSocket.on("close", () => {
     const n = connectionsPerIp.get(ip);
+    if (n === undefined) return;
     if (n <= 1) connectionsPerIp.delete(ip);
     else connectionsPerIp.set(ip, n - 1);
   });
@@ -169,11 +224,9 @@ io.engine.on("connection", (engineSocket) => {
 // Room management
 // ---------------------------------------------------------------------------
 const rooms = {};
-const MAX_JOIN_ATTEMPTS = 5;
 const joinAttempts = new Map();
-
-// Chat rate limiting: one message per 500ms per socket.
-const lastMessageTime = new Map(); // socket.id -> timestamp
+const lastMessageTime = new Map();
+const MAX_JOIN_ATTEMPTS = 5;
 
 function hashPassword(password) {
   return crypto.createHash("sha256").update(password).digest("hex");
@@ -194,20 +247,15 @@ function isValidPassword(value, { min = 4 } = {}) {
   return typeof value === "string" && value.length >= min && value.length <= MAX_PASSWORD_LENGTH;
 }
 
-/**
- * Escapes HTML special characters to prevent XSS.
- * @param {string} str - String to escape.
- * @returns {string} Escaped string.
- */
 function escapeHtml(str) {
-  return str.replace(/&/g, "&amp;")
-            .replace(/</g, "&lt;")
-            .replace(/>/g, "&gt;")
-            .replace(/"/g, "&quot;")
-            .replace(/'/g, "&#039;");
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
 }
 
-// ---- Orphaned room sweeper ----
 function sweepRooms() {
   const now = Date.now();
   for (const [roomId, room] of Object.entries(rooms)) {
@@ -219,7 +267,6 @@ function sweepRooms() {
       continue;
     }
     if (now - room.hostLeftAt >= ROOM_TTL_MS) {
-      // Verifica se a sala ainda existe antes de emitir
       if (rooms[roomId]) {
         io.to(roomId).emit("host-left");
         delete rooms[roomId];
@@ -245,7 +292,7 @@ io.on("connection", (socket) => {
       passwordHash: hashPassword(password),
       hostSocketId: socket.id,
       viewers: new Set(),
-      viewerNumbers: new Map(), // socket.id -> number
+      viewerNumbers: new Map(),
       viewerCounter: 0,
       createdAt: Date.now(),
     };
@@ -297,19 +344,60 @@ io.on("connection", (socket) => {
     socket.data.roomId = normalizedRoomId;
     socket.data.isHost = false;
 
-    // Assign viewer number
     room.viewerCounter += 1;
     const viewerNumber = room.viewerCounter;
     room.viewers.add(socket.id);
     room.viewerNumbers.set(socket.id, viewerNumber);
 
-    // Notify host
     socket.to(room.hostSocketId).emit("viewer-joined", {
       viewerId: socket.id,
       viewerNumber: viewerNumber,
     });
 
     callback({ ok: true });
+  });
+
+  // ----- Restore session (reconnect) -----
+  socket.on("restore-session", ({ roomId, role, password, username } = {}, callback) => {
+    if (typeof callback !== "function") return;
+    if (!roomId || !isValidRoomId(roomId)) {
+      return callback({ ok: false, error: "Invalid room ID." });
+    }
+    const normalizedRoomId = roomId.trim().toUpperCase();
+    const room = rooms[normalizedRoomId];
+    if (!room) {
+      return callback({ ok: false, error: "Room not found." });
+    }
+
+    if (role === "host") {
+      if (room.hostSocketId && io.sockets.sockets.has(room.hostSocketId)) {
+        return callback({ ok: false, error: "Host already connected." });
+      }
+      room.hostSocketId = socket.id;
+      socket.join(normalizedRoomId);
+      socket.data.roomId = normalizedRoomId;
+      socket.data.isHost = true;
+      delete room.hostLeftAt;
+      callback({ ok: true, role: "host" });
+    } else if (role === "viewer") {
+      if (password && room.passwordHash !== hashPassword(password)) {
+        return callback({ ok: false, error: "Invalid password." });
+      }
+      room.viewerCounter += 1;
+      const viewerNumber = room.viewerCounter;
+      room.viewers.add(socket.id);
+      room.viewerNumbers.set(socket.id, viewerNumber);
+      socket.join(normalizedRoomId);
+      socket.data.roomId = normalizedRoomId;
+      socket.data.isHost = false;
+      socket.to(room.hostSocketId).emit("viewer-joined", {
+        viewerId: socket.id,
+        viewerNumber: viewerNumber,
+      });
+      callback({ ok: true, role: "viewer", viewerNumber });
+    } else {
+      callback({ ok: false, error: "Invalid role." });
+    }
   });
 
   // ----- WebRTC signaling -----
@@ -336,21 +424,17 @@ io.on("connection", (socket) => {
   // ----- Chat message -----
   socket.on("chat-message", ({ message } = {}) => {
     const roomId = socket.data.roomId;
-    if (!roomId) return; // not in a room
+    if (!roomId) return;
 
-    // Rate limiting: max 1 message per 500ms
     const now = Date.now();
     const last = lastMessageTime.get(socket.id) || 0;
     if (now - last < 500) return;
     lastMessageTime.set(socket.id, now);
 
-    // Validate length
     if (typeof message !== "string" || message.length === 0 || message.length > 500) return;
 
-    // Sanitize HTML to prevent XSS
     const sanitized = escapeHtml(message);
 
-    // Determine sender info
     const room = rooms[roomId];
     if (!room) return;
 
@@ -362,7 +446,6 @@ io.on("connection", (socket) => {
       viewerNumber = room.viewerNumbers.get(socket.id) || null;
     }
 
-    // Broadcast to everyone in the room except the sender
     socket.to(roomId).emit("chat-message", {
       from: socket.id,
       role: role,
@@ -393,7 +476,6 @@ io.on("connection", (socket) => {
   });
 });
 
-// Start server only when executed directly.
 if (require.main === module) {
   const PORT = process.env.PORT || 3000;
   server.listen(PORT, () => {

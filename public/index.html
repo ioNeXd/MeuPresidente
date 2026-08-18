@@ -11,7 +11,10 @@
 <div class="card">
   <div class="header">
     <h1>🖥️ Screen Sharing</h1>
-    <button id="chatToggle" class="hidden" title="Alternar chat">💬</button>
+    <div class="header-actions">
+      <button id="themeToggle" title="Alternar tema">🌓</button>
+      <button id="chatToggle" class="hidden" title="Alternar chat">💬</button>
+    </div>
   </div>
   <p class="sub">Compartilhamento P2P WebRTC — crie uma sala ou entre com ID</p>
 
@@ -22,17 +25,23 @@
 
   <!-- HOST PANEL -->
   <div id="hostPanel">
+    <label>Seu nome (opcional)</label>
+    <input id="hostUsername" type="text" placeholder="Seu nome" maxlength="30" />
+
     <label>Senha da sala</label>
-    <input id="hostPassword" type="password" placeholder="Defina uma senha" />
+    <div class="password-wrapper">
+      <input id="hostPassword" type="password" placeholder="Defina uma senha" />
+      <span class="toggle-pwd" data-target="hostPassword">👁️</span>
+    </div>
 
     <div class="checkbox-group">
       <input type="checkbox" id="hostEnableMic" checked />
       <label for="hostEnableMic">🎤 Incluir microfone (misturar com áudio do sistema)</label>
     </div>
 
-    <button class="primary" id="btnCreateRoom">Iniciar compartilhamento</button>
+    <button class="primary" id="btnCreateRoom">🚀 Iniciar compartilhamento</button>
 
-    <!-- Host audio controls (hidden initially) -->
+    <!-- Host audio controls -->
     <div class="host-audio-controls">
       <button class="ctrl-btn hidden" id="hostMuteMic">🔊 Mudo Mic</button>
       <label class="hidden" for="hostMicVolume">Ganho mic</label>
@@ -40,8 +49,25 @@
       <span class="volume-label hidden" id="hostMicVolumeLabel">0.80</span>
     </div>
 
+    <!-- Bitrate control -->
+    <div class="bitrate-control">
+      <label for="hostBitrate">
+        <span>Bitrate</span>
+        <span id="hostBitrateValue">500</span> kbps
+      </label>
+      <input type="range" id="hostBitrate" min="100" max="2000" step="50" value="500" />
+    </div>
+
+    <div class="action-row">
+      <button class="ctrl-btn" id="hostRecordBtn">🔴 Gravar</button>
+      <button class="ctrl-btn" id="hostStatsToggle">📊 Estatísticas</button>
+    </div>
+    <div class="stats-panel hidden" id="hostStatsPanel">
+      <div id="hostStatsContent">Aguardando...</div>
+    </div>
+
     <div class="room-info hidden" id="hostRoomInfo">
-      <span>ID: <b id="roomIdDisplay"></b></span>
+      <span>ID: <span class="room-id" id="roomIdDisplay"></span></span>
       <button class="copy-btn" id="copyRoomIdBtn">📋 Copiar</button>
     </div>
     <div class="viewers-list" id="viewersList">Nenhum espectador ainda.</div>
@@ -50,13 +76,21 @@
     <div class="status" id="hostStatus"></div>
   </div>
 
-  <!-- VIEWER PANEL -->
+  <!-- VIEWER PANEL - INICIALMENTE OCULTO -->
   <div id="viewerPanel" class="hidden">
+    <label>Seu nome (opcional)</label>
+    <input id="viewerUsername" type="text" placeholder="Seu nome" maxlength="30" />
+
     <label>ID da sala</label>
     <input id="viewerRoomId" type="text" placeholder="Ex: 7F3K9A" style="text-transform:uppercase" />
+
     <label>Senha</label>
-    <input id="viewerPassword" type="password" placeholder="Senha da sala" />
-    <button class="primary" id="btnJoinRoom">Entrar na sala</button>
+    <div class="password-wrapper">
+      <input id="viewerPassword" type="password" placeholder="Senha da sala" />
+      <span class="toggle-pwd" data-target="viewerPassword">👁️</span>
+    </div>
+
+    <button class="primary" id="btnJoinRoom">🎥 Entrar na sala</button>
 
     <div id="viewerVideoWrap">
       <video id="viewerVideo" autoplay></video>
@@ -74,7 +108,7 @@
     <div class="status" id="viewerStatus"></div>
   </div>
 
-  <!-- CHAT PANEL (shared) -->
+  <!-- CHAT PANEL -->
   <div id="chatContainer" class="hidden">
     <div id="chatMessages"></div>
     <div class="chat-input-row">
@@ -84,7 +118,18 @@
   </div>
 </div>
 
+<!-- Toast container -->
+<div id="toast-container"></div>
+
+<!-- Socket.IO e módulos ES -->
 <script src="/socket.io/socket.io.js"></script>
-<script src="/client.js"></script>
+<script type="importmap">
+{
+  "imports": {
+    "/js/": "/js/"
+  }
+}
+</script>
+<script type="module" src="/js/app.js"></script>
 </body>
 </html>
